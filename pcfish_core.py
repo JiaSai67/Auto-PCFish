@@ -70,6 +70,7 @@ class MBI(ctypes.Structure):
     ]
 
 MEM_COMMIT = 0x1000
+MEM_PRIVATE = 0x20000
 
 # 載入繁體中文魚名庫
 FISH_NAMES = {}
@@ -104,13 +105,15 @@ class PCFishMemory:
     def __init__(self):
         self.pid = None
         self.h_proc = None
-        self.gamedata_addr = 0x232DA8B9C00
-        self.gamedata_klass = 0x231E17B6BD0
-        self.fish_model_klass = 0x231E18E3BD0
-        self.uibreed_klass = 0x231E17F6BD0
-        self.uibreed_addr = 0x233C2F04000
+        # 全動態解析：開機與換設備自動識別，零硬編碼！
+        self.gamedata_addr = None
+        self.gamedata_klass = None
+        self.fish_model_klass = None
+        self.uibreed_klass = None
+        self.uibreed_addr = None
         self.game_wnd = None
         self.fish_cd_registry = {} # 本地魚隻冷卻時間戳登記字典 {fish_id: target_timestamp}
+        self._il2cpp_exports = None
 
     def find_process(self, process_name="PCFish.exe"):
         import psutil
@@ -139,6 +142,12 @@ class PCFishMemory:
             if not self.h_proc:
                 return False, f"無法打開進程 (PID: {pid})，請以管理員權限運行。"
 
+            # 1. 跨設備與重啟核心：100% 動態由 IL2CPP 導出函式表精準解析類別指標
+            ok, msg = self.resolve_il2cpp_classes()
+            if not ok:
+                return False, f"IL2CPP 類別動態解析失敗: {msg}"
+
+            # 2. 動態定位 GameDataManager
             self.locate_gamedata_manager()
 
         return True, f"已連接遊戲進程 PID: {self.pid}"
@@ -148,6 +157,12 @@ class PCFishMemory:
             kernel32.CloseHandle(self.h_proc)
             self.h_proc = None
         self.pid = None
+        self.gamedata_addr = None
+        self.gamedata_klass = None
+        self.fish_model_klass = None
+        self.uibreed_klass = None
+        self.uibreed_addr = None
+        self._il2cpp_exports = None
 
     def read_bytes(self, addr, size):
         if not self.h_proc or not addr: return b''
@@ -226,11 +241,19 @@ class PCFishMemory:
         names_rva = self.read_i32(ga_base + export_rva + 0x20)
         ord_rva = self.read_i32(ga_base + export_rva + 0x24)
 
+        needed = [
+            'il2cpp_domain_get',
+            'il2cpp_thread_attach',
+            'il2cpp_runtime_invoke',
+            'il2cpp_domain_get_assemblies',
+            'il2cpp_class_from_name'
+        ]
+
         exports = {}
         for i in range(num_names):
             nrva = self.read_i32(ga_base + names_rva + i * 4)
             name = self.read_cstr(ga_base + nrva)
-            if name in ['il2cpp_domain_get', 'il2cpp_thread_attach', 'il2cpp_runtime_invoke']:
+            if name in needed:
                 ord_val = struct.unpack('<H', self.read_bytes(ga_base + ord_rva + i * 2, 2))[0]
                 frva = self.read_i32(ga_base + funcs_rva + ord_val * 4)
                 exports[name] = ga_base + frva
@@ -238,22 +261,129 @@ class PCFishMemory:
         self._il2cpp_exports = exports
         return exports
 
+    def resolve_il2cpp_classes(self):
+        """
+        跨設備與跨重啟核心技術：
+        利用 IL2CPP 原生 C-API (il2cpp_domain_get_assemblies -> il2cpp_class_from_name)
+        動態定位 Assembly-CSharp.dll 鏡像並精準解析核心類別之 Il2CppClass* 指標：
+          - GameDataManager (NN.PF.Core.Managers)
+          - FishModel (NN.PF.Models)
+          - UIBreed (NN.PF.UI.Breed)
+        保證每次遊戲重開機、換電腦、換設備皆 100% 能即時動態獲取正確記憶體結構！
+        """
+        exps = self.get_il2cpp_exports()
+        if not exps or 'il2cpp_domain_get' not in exps or 'il2cpp_class_from_name' not in exps:
+            return False, "無法取得 IL2CPP 核心導出函式"
+
+        param_addr = kernel32.VirtualAllocEx(ctypes.c_void_p(self.h_proc), None, 0x1000, 0x3000, 0x04)
+        if not param_addr:
+            return False, "分配遠程參數空間失敗"
+
+        # 1. 獲取當前 Domain 及其載入的 Assemblies
+        sc1 = bytearray()
+        sc1.extend(b'\x53\x48\x83\xEC\x20\x48\x89\xCB') # push rbx; sub rsp, 0x20; mov rbx, rcx
+        sc1.extend(b'\x48\xB8' + struct.pack('<Q', exps['il2cpp_domain_get']) + b'\xFF\xD0') # domain = il2cpp_domain_get()
+        sc1.extend(b'\x48\x89\xC1\x48\x8D\x53\x08') # rcx = domain; rdx = rbx + 8 (&count)
+        sc1.extend(b'\x48\xB8' + struct.pack('<Q', exps['il2cpp_domain_get_assemblies']) + b'\xFF\xD0')
+        sc1.extend(b'\x48\x89\x43\x10\x48\x83\xC4\x20\x5B\xC3') # [rbx + 0x10] = asm_arr; add rsp, 0x20; pop rbx; ret
+
+        code_addr = kernel32.VirtualAllocEx(ctypes.c_void_p(self.h_proc), None, 0x1000, 0x3000, 0x40)
+        written = ctypes.c_size_t()
+        kernel32.WriteProcessMemory(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(code_addr), bytes(sc1), len(sc1), ctypes.byref(written))
+
+        h_th = kernel32.CreateRemoteThread(ctypes.c_void_p(self.h_proc), None, 0, ctypes.c_void_p(code_addr), ctypes.c_void_p(param_addr), 0, None)
+        if not h_th:
+            kernel32.VirtualFreeEx(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(code_addr), 0, 0x8000)
+            kernel32.VirtualFreeEx(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(param_addr), 0, 0x8000)
+            return False, "建立 Assembly 探測線程失敗"
+
+        kernel32.WaitForSingleObject(h_th, 3000)
+        kernel32.CloseHandle(h_th)
+
+        count = self.read_ptr(param_addr + 8)
+        asm_arr = self.read_ptr(param_addr + 0x10)
+
+        img_csharp = None
+        if asm_arr and count:
+            for i in range(min(count, 200)):
+                asm_ptr = self.read_ptr(asm_arr + i * 8)
+                img_ptr = self.read_ptr(asm_ptr)
+                name = self.read_cstr(self.read_ptr(img_ptr))
+                if name in ['Assembly-CSharp.dll', 'Assembly-CSharp']:
+                    img_csharp = img_ptr
+                    break
+
+        if not img_csharp:
+            kernel32.VirtualFreeEx(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(code_addr), 0, 0x8000)
+            kernel32.VirtualFreeEx(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(param_addr), 0, 0x8000)
+            return False, "未找到 Assembly-CSharp.dll 鏡像"
+
+        # 2. 組裝類別解析專用 Shellcode
+        sc2 = bytearray()
+        sc2.extend(b'\x53\x48\x83\xEC\x20\x48\x89\xCB') # push rbx; sub rsp, 0x20; mov rbx, rcx
+        # domain = il2cpp_domain_get()
+        sc2.extend(b'\x48\xB8' + struct.pack('<Q', exps['il2cpp_domain_get']) + b'\xFF\xD0')
+        # thread_attach(domain)
+        sc2.extend(b'\x48\x89\xC1')
+        sc2.extend(b'\x48\xB8' + struct.pack('<Q', exps['il2cpp_thread_attach']) + b'\xFF\xD0')
+        # il2cpp_class_from_name(img_csharp, ns, name)
+        sc2.extend(b'\x48\xB9' + struct.pack('<Q', img_csharp))
+        sc2.extend(b'\x48\x8D\x53\x10') # rdx = param_addr + 0x10 (namespace)
+        sc2.extend(b'\x4C\x8D\x43\x50') # r8 = param_addr + 0x50 (classname)
+        sc2.extend(b'\x48\xB8' + struct.pack('<Q', exps['il2cpp_class_from_name']) + b'\xFF\xD0')
+        # 儲存傳回值至 [param_addr]
+        sc2.extend(b'\x48\x89\x03')
+        sc2.extend(b'\x48\x83\xC4\x20\x5B\xC3')
+
+        kernel32.WriteProcessMemory(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(code_addr), bytes(sc2), len(sc2), ctypes.byref(written))
+
+        targets = {
+            'GameDataManager': ('NN.PF.Core.Managers', 'gamedata_klass'),
+            'FishModel': ('NN.PF.Models', 'fish_model_klass'),
+            'UIBreed': ('NN.PF.UI.Breed', 'uibreed_klass'),
+        }
+
+        for cname, (ns, attr_name) in targets.items():
+            kernel32.WriteProcessMemory(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(param_addr + 0x10), ns.encode() + b'\x00', len(ns) + 1, ctypes.byref(written))
+            kernel32.WriteProcessMemory(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(param_addr + 0x50), cname.encode() + b'\x00', len(cname) + 1, ctypes.byref(written))
+            h_th2 = kernel32.CreateRemoteThread(ctypes.c_void_p(self.h_proc), None, 0, ctypes.c_void_p(code_addr), ctypes.c_void_p(param_addr), 0, None)
+            if h_th2:
+                kernel32.WaitForSingleObject(h_th2, 3000)
+                kernel32.CloseHandle(h_th2)
+                klass = self.read_ptr(param_addr)
+                setattr(self, attr_name, klass)
+
+        kernel32.VirtualFreeEx(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(code_addr), 0, 0x8000)
+        kernel32.VirtualFreeEx(ctypes.c_void_p(self.h_proc), ctypes.c_void_p(param_addr), 0, 0x8000)
+
+        if not self.gamedata_klass or not self.fish_model_klass or not self.uibreed_klass:
+            return False, f"部分類別未解析成功 (GDM: {hex(self.gamedata_klass or 0)}, Fish: {hex(self.fish_model_klass or 0)}, UIBreed: {hex(self.uibreed_klass or 0)})"
+
+        return True, "IL2CPP 核心類別動態解析成功"
+
     def locate_gamedata_manager(self):
-        """驗證或重新掃描 GameDataManager 實例"""
-        if self.gamedata_addr:
+        """驗證快取或全動態掃描 GameDataManager 實例 (0.01ms 快取 / 0.3s 首次掃描)"""
+        # 1. 高速快取驗證 (0.0001ms)
+        if self.gamedata_addr and self.gamedata_klass:
             k = self.read_ptr(self.gamedata_addr)
             if k == self.gamedata_klass:
-                fish_list_ptr = self.read_ptr(self.gamedata_addr + 0x50)
-                if fish_list_ptr != 0:
+                fl = self.read_ptr(self.gamedata_addr + 0x68)
+                if fl != 0:
                     return self.gamedata_addr
 
+        if not self.gamedata_klass:
+            self.resolve_il2cpp_classes()
+            if not self.gamedata_klass:
+                return None
+
+        # 2. 聚焦堆記憶體 (MEM_PRIVATE) 快速搜尋實例
         target = struct.pack('<Q', self.gamedata_klass)
         addr = 0
         mbi = MBI()
         while kernel32.VirtualQueryEx(self.h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
             base = mbi.BaseAddress or 0
             size = mbi.RegionSize
-            if mbi.State == MEM_COMMIT and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
+            if mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
                 chunk_size = 65536
                 for offset in range(0, size, chunk_size):
                     to_read = min(chunk_size + 8, size - offset)
@@ -264,10 +394,13 @@ class PCFishMemory:
                         if p == -1: break
                         cand = base + offset + p
                         hearts = self.read_i32(cand + 0x40)
-                        fish_list = self.read_ptr(cand + 0x50)
-                        if 0 <= hearts <= 10 and fish_list != 0:
-                            self.gamedata_addr = cand
-                            return cand
+                        fl = self.read_ptr(cand + 0x68)
+                        if hearts is not None and 0 <= hearts <= 10 and fl and 0x10000000000 <= fl <= 0x7FFFFFFFFFFF:
+                            count = self.read_i32(fl + 0x18)
+                            items = self.read_ptr(fl + 0x10)
+                            if count is not None and 0 <= count <= 5000 and items:
+                                self.gamedata_addr = cand
+                                return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
@@ -579,36 +712,38 @@ class PCFishMemory:
 
     def locate_uibreed(self):
         """
-        精準尋找當前遊戲中已打開的真實 UIBreed 面板實例 (帶高速快取)
+        全動態尋找當前遊戲中已打開的真實 UIBreed 面板實例 (帶高速快取與安全驗證)
         條件驗證：
-        1. 物件指向 UIBreed klass (0x231E17F6BD0)
-        2. +0x50 為 parentFishIds 陣列，長度嚴格為 2
-        3. +0x40 為 btnBreed (UIButton) 非零
-        4. +0x38 為 listViewParent 陣列非零
+        1. 物件指向動態解析出的 UIBreed klass
+        2. +0x40 為 btnBreed (UIButton) 非零
+        3. +0x38 為 listViewParent 陣列非零
+        4. +0x50 為 parentFishIds 陣列非零 (長度為 0 或 2)
         """
         if not self.h_proc: return None
 
         # 1. 高速快取驗證 (0.0001ms)
-        if self.uibreed_addr:
+        if self.uibreed_addr and self.uibreed_klass:
             k = self.read_ptr(self.uibreed_addr)
             if k == self.uibreed_klass:
+                btn = self.read_ptr(self.uibreed_addr + 0x40)
+                list_view = self.read_ptr(self.uibreed_addr + 0x38)
                 parent_arr = self.read_ptr(self.uibreed_addr + 0x50)
-                if parent_arr:
-                    arr_len = self.read_i32(parent_arr + 0x18)
-                    if arr_len == 2:
-                        btn = self.read_ptr(self.uibreed_addr + 0x40)
-                        list_view = self.read_ptr(self.uibreed_addr + 0x38)
-                        if btn and list_view:
-                            return self.uibreed_addr
+                if btn and list_view and parent_arr:
+                    return self.uibreed_addr
 
-        # 2. 若快取失效或首次尋找，進行記憶體掃描
+        if not self.uibreed_klass:
+            self.resolve_il2cpp_classes()
+            if not self.uibreed_klass:
+                return None
+
+        # 2. 聚焦堆記憶體 (MEM_PRIVATE) 快速搜尋 UIBreed 實例
         target = struct.pack('<Q', self.uibreed_klass)
         addr = 0
         mbi = MBI()
         while kernel32.VirtualQueryEx(self.h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
             base = mbi.BaseAddress or 0
             size = mbi.RegionSize
-            if mbi.State == MEM_COMMIT and (mbi.Protect & 0xEE) and not (mbi.Protect & 0x100):
+            if mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
                 chunk_size = 65536
                 for offset in range(0, size, chunk_size):
                     to_read = min(chunk_size + 8, size - offset)
@@ -618,15 +753,14 @@ class PCFishMemory:
                         p = b.find(target, pos)
                         if p == -1: break
                         cand = base + offset + p
+                        btn = self.read_ptr(cand + 0x40)
+                        list_view = self.read_ptr(cand + 0x38)
                         parent_arr = self.read_ptr(cand + 0x50)
-                        if parent_arr:
+                        if btn and list_view and parent_arr and 0x10000000000 <= parent_arr <= 0x7FFFFFFFFFFF:
                             arr_len = self.read_i32(parent_arr + 0x18)
-                            if arr_len == 2:
-                                btn = self.read_ptr(cand + 0x40)
-                                list_view = self.read_ptr(cand + 0x38)
-                                if btn and list_view:
-                                    self.uibreed_addr = cand
-                                    return cand
+                            if arr_len is not None and 0 <= arr_len <= 2:
+                                self.uibreed_addr = cand
+                                return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break

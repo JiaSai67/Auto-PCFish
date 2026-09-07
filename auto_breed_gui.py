@@ -19,7 +19,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖管理終端 v1.0.1 PRO")
+        self.root.title("PC Fish 智能繁殖管理終端 v1.0.2 PRO")
         self.root.geometry("720x820")
         self.root.minsize(680, 680)
         self.root.configure(bg="#181825")
