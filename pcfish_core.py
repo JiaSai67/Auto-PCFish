@@ -699,10 +699,11 @@ class PCFishMemory:
         2. 配種規則判斷：
            - 若 same_rarity_only=True (只允許同稀有度)：
              親代 2 必須與親代 1 嚴格相同稀有度 (普通+普通、高級+高級等)，禁止任何跨階配種！
-           - 若 same_rarity_only=False (預設模式)：
-             允許「同階」或「最多差1階」(R1 與 R1-1) 配種。
+           - 若 same_rarity_only=False (預設：最高期望值神話魚流水線模式)：
+             依據官方 100% 原始機率表執行黃金階梯：4x4 > 4x3 > 3x3 > 2x2 > 1x1 > 1x0 > 0x0
+             嚴格禁止 3+2（神話率 0%）與 2+1（傳奇率 0%）降階污染！
         3. 搜尋策略：
-           - 從庫存中最高品質魚隻開始向下尋找最合適的合法組合。
+           - 優先消化雙傳奇 (4x4)；孤兒傳奇則由稀有魚 (4x3) 催化；其餘層級嚴格同階融合提純。
         回傳: (p1, p2, status_msg)
         """
         if excluded_names is None:
@@ -736,15 +737,18 @@ class PCFishMemory:
                 return None, None, f"⏳ 魚隻冷卻中：[{first_cd['rarity']} {first_cd['name']}] 尚需等待 {mm:02d}:{ss:02d}，暫停循環等待冷卻完畢"
             return None, None, f"可用魚隻不足 2 條 (符合條件剩餘: {len(available)} 條，可能被鎖定或排除)"
 
-        # 模式 1：只允許同稀有度繁殖 (嚴格禁止跨階)
+        # 分組各稀有度可用魚
+        by_grade = {}
+        for f in available:
+            g = f['grade']
+            by_grade.setdefault(g, []).append(f)
+
+        # 模式 1：只允許同稀有度繁殖 (嚴格禁止任何跨階)
         if same_rarity_only:
-            for i in range(len(available)):
-                cand1 = available[i]
-                r1 = cand1['grade']
-                for j in range(i + 1, len(available)):
-                    cand2 = available[j]
-                    if cand2['grade'] == r1:
-                        return cand1, cand2, ""
+            # 由高至低嘗試同稀有度成對 (5x5, 4x4, 3x3, 2x2, 1x1, 0x0)
+            for g in sorted(by_grade.keys(), reverse=True):
+                if len(by_grade[g]) >= 2:
+                    return by_grade[g][0], by_grade[g][1], ""
 
             # 若無可用同階組合，檢查是否有同階魚正在冷卻中
             for cand1 in available:
@@ -759,29 +763,65 @@ class PCFishMemory:
 
             return None, None, "保護機制生效：已開啟「只允許同稀有度繁殖」，庫存中無任何可成對的同階可用魚隻！"
 
-        # 模式 2：預設配種邏輯 (同階 或 最多差 1 階)
-        for i in range(len(available)):
-            cand1 = available[i]
-            r1 = cand1['grade']
-            allowed_grades = {r1, max(0, r1 - 1)}
-            for j in range(i + 1, len(available)):
-                cand2 = available[j]
-                if cand2['grade'] in allowed_grades:
-                    return cand1, cand2, ""
+        # 模式 2：最高期望值神話魚繁殖流水線 (基於官方 100% 原始機率矩陣)
+        # 階梯 0: 神話雙拼 (5x5) - 若庫存有解鎖的 2 隻以上神話魚
+        if len(by_grade.get(5, [])) >= 2:
+            return by_grade[5][0], by_grade[5][1], ""
 
-        # 若無可用組合，檢查是否有冷卻中的同階或次階魚
+        # 階梯 1: 傳奇雙拼 (4x4) - Total 8, 神話 5.0%, 傳奇 51.3%, 稀有 43.7% (零降階污染)
+        if len(by_grade.get(4, [])) >= 2:
+            return by_grade[4][0], by_grade[4][1], ""
+
+        # 階梯 2: 傳奇-稀有催化 (4x3) - Total 7, 神話 3.5%, 傳奇 44.4%, 稀有 52.1% (全遊戲最高性價比發動機)
+        # 僅在傳奇魚為單隻無法湊齊 4x4 時發動
+        if len(by_grade.get(4, [])) >= 1 and len(by_grade.get(3, [])) >= 1:
+            return by_grade[4][0], by_grade[3][0], ""
+
+        # 階梯 3: 稀有雙拼 (3x3) - Total 6, 神話 2.0%, 傳奇 10.0%, 稀有 47.5% (解鎖神話的平民發動機)
+        # 嚴格禁止配高級 (3x2 Total 5 神話率為 0.0%)
+        if len(by_grade.get(3, [])) >= 2:
+            return by_grade[3][0], by_grade[3][1], ""
+
+        # 階梯 4: 高級雙拼 (2x2) - Total 4, 稀有 15.0%, 傳奇 3.0% (解鎖傳奇暴擊)
+        # 嚴格禁止配普通 (2x1 Total 3 傳奇率直接歸零 0.0%)
+        if len(by_grade.get(2, [])) >= 2:
+            return by_grade[2][0], by_grade[2][1], ""
+
+        # 階梯 5: 普通雙拼 (1x1) - Total 2, 高級 20.0%, 稀有 4.0%
+        if len(by_grade.get(1, [])) >= 2:
+            return by_grade[1][0], by_grade[1][1], ""
+
+        # 階梯 6: 胚子提純 (1x0 或 0x0)
+        if len(by_grade.get(1, [])) >= 1 and len(by_grade.get(0, [])) >= 1:
+            return by_grade[1][0], by_grade[0][0], ""
+        if len(by_grade.get(0, [])) >= 2:
+            return by_grade[0][0], by_grade[0][1], ""
+
+        # 若當前庫存無法形成任何合法高期望值組合，尋找冷卻中的配對對象
+        expected_pair_grades = {
+            4: {4, 3},
+            3: {3, 4},
+            2: {2},
+            1: {1},
+            0: {0, 1}
+        }
+
         for cand1 in available:
             r1 = cand1['grade']
-            allowed_grades = {r1, max(0, r1 - 1)}
-            cd_cands = [f for f in all_fish if f['can_breed'] and f['grade'] in allowed_grades and f['is_cooldown'] and f['id'] != cand1['id'] and f['name'] not in excluded_names]
+            wanted_grades = expected_pair_grades.get(r1, {r1})
+            cd_cands = [
+                f for f in all_fish 
+                if f['can_breed'] and not f['is_locked'] and f['grade'] in wanted_grades 
+                and f['is_cooldown'] and f['id'] != cand1['id'] and f['name'] not in excluded_names
+            ]
             if cd_cands:
                 min_cd = min(f['cd_remain'] for f in cd_cands)
                 cd_fish = next(f for f in cd_cands if f['cd_remain'] == min_cd)
                 mm = min_cd // 60
                 ss = min_cd % 60
-                return None, None, f"⏳ 等待冷卻：[{cand1['rarity']} {cand1['name']}] 的合適配對對象 [{cd_fish['rarity']} {cd_fish['name']}] 仍在冷卻中 (剩餘 {mm:02d}:{ss:02d})"
+                return None, None, f"⏳ 等待最高期望值對象冷卻：[{cand1['rarity']} {cand1['name']}] 正在等待 [{cd_fish['rarity']} {cd_fish['name']}] 冷卻完畢 (剩餘 {mm:02d}:{ss:02d})"
 
-        return None, None, "保護機制生效：庫存中無任何符合「最多差1階」配種規則的可用組合！"
+        return None, None, "保護機制生效：無符合最高期望值之配對組合（已嚴格杜絕 3+2、2+1 降階稀釋），請補充魚隻或等待孵化！"
 
     def locate_uibreed(self):
         """

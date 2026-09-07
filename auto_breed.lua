@@ -105,13 +105,32 @@ function GetTopTwoAvailableFish()
         return a.remainCount > b.remainCount
     end)
 
-    if #eligible >= 2 then
-        return eligible[1], eligible[2], #eligible
-    elseif #eligible == 1 then
-        return eligible[1], nil, 1
-    else
-        return nil, nil, 0
+    -- 分組各稀有度可用魚 (最高期望值黃金階梯)
+    local byGrade = {}
+    for i = 0, 5 do byGrade[i] = {} end
+    for _, f in ipairs(eligible) do
+        local g = f.grade
+        if byGrade[g] then
+            table.insert(byGrade[g], f)
+        end
     end
+
+    -- 最高期望值配對階梯：
+    -- 1. 雙傳奇 (4x4) -> Total 8 (神話 5.0%, 傳奇 51.3%, 稀有 43.7%)
+    if #byGrade[4] >= 2 then return byGrade[4][1], byGrade[4][2], #eligible end
+    -- 2. 傳奇-稀有催化 (4x3) -> Total 7 (神話 3.5%, 傳奇 44.4%, 稀有 52.1%)
+    if #byGrade[4] >= 1 and #byGrade[3] >= 1 then return byGrade[4][1], byGrade[3][1], #eligible end
+    -- 3. 雙稀有 (3x3) -> Total 6 (神話 2.0%, 傳奇 10.0%, 嚴禁配高級 3x2)
+    if #byGrade[3] >= 2 then return byGrade[3][1], byGrade[3][2], #eligible end
+    -- 4. 雙高級 (2x2) -> Total 4 (稀有 15.0%, 傳奇 3.0%, 嚴禁配普通 2x1)
+    if #byGrade[2] >= 2 then return byGrade[2][1], byGrade[2][2], #eligible end
+    -- 5. 雙普通 (1x1) -> Total 2 (高級 20.0%, 稀有 4.0%)
+    if #byGrade[1] >= 2 then return byGrade[1][1], byGrade[1][2], #eligible end
+    -- 6. 胚子提純 (1x0 或 0x0)
+    if #byGrade[1] >= 1 and #byGrade[0] >= 1 then return byGrade[1][1], byGrade[0][1], #eligible end
+    if #byGrade[0] >= 2 then return byGrade[0][1], byGrade[0][2], #eligible end
+
+    return nil, nil, #eligible
 end
 
 -- 4. 核心配種邏輯 (單次安全執行)
