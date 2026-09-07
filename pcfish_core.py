@@ -964,18 +964,8 @@ class PCFishMemory:
         if not methods_ptr:
             return False, "無法讀取 UIBreed 函式表"
 
-        # 動態遍歷 UIBreed 函式表，精準定位 "Breed" 核心 MethodInfo 指針 (防禦索引硬編碼偏移)
-        mi_breed = None
-        for i in range(25):
-            m = self.read_ptr(methods_ptr + i * 8)
-            if m:
-                p_name = self.read_ptr(m + 0x18)
-                if p_name and self.read_cstr(p_name) == "Breed":
-                    mi_breed = m
-                    break
-        if not mi_breed:
-            mi_breed = self.read_ptr(methods_ptr + 9 * 8)
-
+        # Method[9]: Breed (核心按鈕繁殖事件)
+        mi_breed = self.read_ptr(methods_ptr + 9 * 8)
         if not mi_breed:
             return False, "未找到 Breed 核心指針"
 
@@ -987,16 +977,7 @@ class PCFishMemory:
         fn_thread_attach = exports['il2cpp_thread_attach']
         fn_runtime_invoke = exports['il2cpp_runtime_invoke']
 
-        # 配置 0x200 bytes 遠程空間：前 0x100 作為 shellcode，後 0x100 作為 exc 輸出緩衝區
-        alloc_size = 0x200
-        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, alloc_size, 0x1000 | 0x2000, 0x40)
-        if not code_addr:
-            return False, "分配遠程代碼空間失敗"
-
-        exc_addr = code_addr + 0x100
-        self.write_ptr(exc_addr, 0)
-
-        # 組裝 x64 遠程執行機器碼 (註冊 IL2CPP 線程 -> 單次調用 UIBreed.Breed，帶 &exc 安全保護)
+        # 組裝 x64 遠程執行機器碼 (註冊 IL2CPP 線程 -> 單次調用 UIBreed.Breed)
         shellcode = bytearray()
         shellcode.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
 
@@ -1009,16 +990,20 @@ class PCFishMemory:
         shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_thread_attach))
         shellcode.extend(b'\xFF\xD0')
 
-        # 3. il2cpp_runtime_invoke(mi_breed, u, NULL, &exc) -> 原生發送繁殖訊號
+        # 3. il2cpp_runtime_invoke(mi_breed, u, NULL, NULL) -> 原生發送繁殖訊號 (僅調用一次！)
         shellcode.extend(b'\x48\xB9' + struct.pack('<Q', mi_breed))
         shellcode.extend(b'\x48\xBA' + struct.pack('<Q', u))
         shellcode.extend(b'\x4D\x31\xC0') # params = NULL
-        shellcode.extend(b'\x49\xB9' + struct.pack('<Q', exc_addr)) # r9 = &exc (核心安全防護：捕捉異常，嚴防遊戲閃退！)
+        shellcode.extend(b'\x4D\x31\xC9') # exc = NULL
         shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke))
         shellcode.extend(b'\xFF\xD0')
 
         shellcode.extend(b'\x48\x83\xC4\x28') # add rsp, 0x28
         shellcode.extend(b'\xC3') # ret
+
+        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(shellcode), 0x1000 | 0x2000, 0x40)
+        if not code_addr:
+            return False, "分配遠程代碼空間失敗"
 
         written = ctypes.c_size_t()
         kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(shellcode), len(shellcode), ctypes.byref(written))
@@ -1028,14 +1013,9 @@ class PCFishMemory:
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
             return False, "建立遠程記憶體執行緒失敗"
 
-        kernel32.WaitForSingleObject(h_thread, 4000)
+        kernel32.WaitForSingleObject(h_thread, 5000)
         kernel32.CloseHandle(h_thread)
-
-        exc_val = self.read_ptr(exc_addr)
         kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
-
-        if exc_val:
-            return False, f"遊戲端拒絕繁殖請求 (Managed Exception: {hex(exc_val)})，請確認愛心或魚隻狀態"
 
         return True, f"⚡ 純記憶體訊號發送成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
 
