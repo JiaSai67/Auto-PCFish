@@ -236,14 +236,20 @@ def run_diagnosis():
                         else:
                             count = core.read_i32(fl + 0x18)
                             items = core.read_ptr(fl + 0x10)
-                            if count is None or not (0 <= count <= 5000):
-                                rejection_reasons.append(f"{details} -> 排除: 魚庫數量異常 ({count})")
+                            tank_lvl = core.read_i32(cand + 0x38)
+                            if count is None or count <= 0 or count > 5000:
+                                rejection_reasons.append(f"{details} -> 排除: 魚庫數量異常或為空 ({count})")
                             elif not items:
                                 rejection_reasons.append(f"{details} -> 排除: 魚庫陣列指針為空")
+                            elif tank_lvl is not None and tank_lvl < 1:
+                                rejection_reasons.append(f"{details} -> 排除: 魚缸等級為 0 (未初始化實例)")
                             else:
                                 accepted_inst = cand
                                 rejection_reasons.append(f"{details} -> ✅ 符合所有條件！已選定為有效單例！")
+                                break
                         pos = p + 8
+                    if accepted_inst: break
+                if accepted_inst: break
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
 
@@ -263,8 +269,12 @@ def run_diagnosis():
     log("[ 8. 即時數據讀取實測 (Hearts & Fish Inventory) ]")
     gdm = core.locate_gamedata_manager()
     if gdm:
+        saved_h = core.read_i32(gdm + 0x40) or 0
+        last_ts = core.read_i64(gdm + 0x48) or 0
+        tank_lvl = core.read_i32(gdm + 0x38) or 0
         hearts, timer_str, is_valid, target_ts = core.get_breed_heart_status()
-        log(f"  • 愛心狀態: {hearts} 顆 | 計時字串: {timer_str} | 有效性: {is_valid}")
+        log(f"  • 記憶體底層數值: 存檔愛心={saved_h} | 魚缸等級={tank_lvl} | 時間戳={last_ts}")
+        log(f"  • 動態愛心計算: {hearts} 顆 | 計時倒數: {timer_str} | 目標時間戳={target_ts} | 有效性={is_valid}")
         fishes = core.get_all_fish()
         log(f"  • 魚庫清單: 成功讀取 {len(fishes)} 隻魚")
         if fishes:
@@ -273,7 +283,16 @@ def run_diagnosis():
         log("  ❌ GameDataManager 未能成功定位，無法讀取愛心與魚隻！")
 
     u = core.locate_uibreed()
-    log(f"  • UIBreed (繁殖面板) 定位狀態: {hex(u) if u else '未開啟 (請在遊戲中打開繁殖介面)'}")
+    if u:
+        txt_ptr = core.read_ptr(u + 0x30)
+        scr_text = ""
+        if txt_ptr:
+            s_ptr = core.read_ptr(txt_ptr + 0xe0)
+            if s_ptr:
+                scr_text = core.read_utf16_str(s_ptr) or ""
+        log(f"  • UIBreed (繁殖面板): 定位成功 ({hex(u)}) | 遊戲畫面文字: \"{scr_text}\"")
+    else:
+        log(f"  • UIBreed (繁殖面板): 未開啟 (請在遊戲中打開繁殖面板)")
     log("")
 
     # -------------------------------------------------------------

@@ -395,10 +395,12 @@ class PCFishMemory:
                         cand = base + offset + p
                         hearts = self.read_i32(cand + 0x40)
                         fl = self.read_ptr(cand + 0x68)
+                        tank_lvl = self.read_i32(cand + 0x38)
                         if hearts is not None and 0 <= hearts <= 10 and fl and 0x10000 <= fl <= 0x7FFFFFFFFFFF:
                             count = self.read_i32(fl + 0x18)
                             items = self.read_ptr(fl + 0x10)
-                            if count is not None and 0 <= count <= 5000 and items:
+                            # 優先過濾空實例，鎖定包含魚庫且魚缸等級有效之正式單例
+                            if count is not None and count > 0 and items and (tank_lvl is None or tank_lvl >= 1):
                                 self.gamedata_addr = cand
                                 return cand
 
@@ -422,14 +424,14 @@ class PCFishMemory:
                         p = b.find(target, pos)
                         if p == -1: break
                         cand = base + offset + p
-                        # 避開 GameAssembly.dll 模組內部（排除型別元數據自引用）
                         if not (ga_base <= cand <= ga_base + 0x5000000):
                             hearts = self.read_i32(cand + 0x40)
                             fl = self.read_ptr(cand + 0x68)
+                            tank_lvl = self.read_i32(cand + 0x38)
                             if hearts is not None and 0 <= hearts <= 10 and fl and 0x10000 <= fl <= 0x7FFFFFFFFFFF:
                                 count = self.read_i32(fl + 0x18)
                                 items = self.read_ptr(fl + 0x10)
-                                if count is not None and 0 <= count <= 5000 and items:
+                                if count is not None and count > 0 and items and (tank_lvl is None or tank_lvl >= 1):
                                     self.gamedata_addr = cand
                                     return cand
                         pos = p + 8
@@ -461,31 +463,70 @@ class PCFishMemory:
 
     def get_breed_heart_status(self):
         """
-        100% 直讀 GameDataManager 愛心數量與精準倒數時間戳
+        100% 精準計算或直讀遊戲愛心數量與倒數計時
+        支援從 GameDataManager.breedTimestamp 計算恢復，並與 UIBreed 面板即時狀態交叉驗證
         回傳: (hearts, timer_str, ok, target_ts)
         """
         if not self.h_proc:
             return 0, "未連線", False, 0
 
+        # 優先嘗試從當前打開的 UIBreed 面板直讀遊戲畫面實際顯示字串
+        uib = self.locate_uibreed()
+        uib_timer_str = None
+        if uib:
+            txt_ptr = self.read_ptr(uib + 0x30)
+            if txt_ptr and 0x10000 <= txt_ptr <= 0x7FFFFFFFFFFF:
+                s_ptr = self.read_ptr(txt_ptr + 0xe0)
+                if s_ptr and 0x10000 <= s_ptr <= 0x7FFFFFFFFFFF:
+                    s = self.read_utf16_str(s_ptr)
+                    if s and (s.strip() == "MAX" or ":" in s):
+                        uib_timer_str = s.strip()
+
         mgr = self.locate_gamedata_manager()
+        now_ts = int(time.time())
+        interval = int(self.get_heart_interval())
+
         if not mgr:
+            if uib_timer_str == "MAX":
+                return 5, "MAX", True, 0
             return 0, "搜尋中...", False, 0
 
-        hearts = self.read_i32(mgr + 0x40)
-        last_ts = self.read_i64(mgr + 0x48)
-        now_ts = int(time.time())
+        saved_hearts = self.read_i32(mgr + 0x40) or 0
+        last_ts = self.read_i64(mgr + 0x48) or 0
 
-        if hearts >= 5:
-            return 5, "MAX", True, 0
+        # 若最後紀錄的時間戳為 0 或過於久遠（代表滿愛心未消耗）
+        if last_ts <= 0 or (now_ts - last_ts) >= interval * 5:
+            cur_hearts = 5
+            timer_str = "MAX"
+            target_ts = 0
+        else:
+            elapsed = max(0, now_ts - last_ts)
+            gained = elapsed // interval
+            cur_hearts = min(5, max(0, saved_hearts) + gained)
 
-        interval = int(self.get_heart_interval())
-        target_ts = last_ts + interval
-        diff_sec = max(0, target_ts - now_ts)
-        mm = diff_sec // 60
-        ss = diff_sec % 60
-        timer_str = f"{mm:02d}:{ss:02d}"
+            if cur_hearts >= 5:
+                cur_hearts = 5
+                timer_str = "MAX"
+                target_ts = 0
+            else:
+                rem_sec = interval - (elapsed % interval)
+                target_ts = now_ts + rem_sec
+                mm = rem_sec // 60
+                ss = rem_sec % 60
+                timer_str = f"{mm:02d}:{ss:02d}"
 
-        return hearts, timer_str, True, target_ts
+        # 若 UIBreed 面板當前明確顯示 MAX，強制同步滿心
+        if uib_timer_str == "MAX":
+            cur_hearts = 5
+            timer_str = "MAX"
+            target_ts = 0
+        elif uib_timer_str and ":" in uib_timer_str and cur_hearts >= 5:
+            # 畫面若顯示倒數中，愛心數至少扣 1
+            cur_hearts = 4
+            timer_str = uib_timer_str
+
+        return cur_hearts, timer_str, True, target_ts
+
 
     def get_all_fish(self):
         """
@@ -785,12 +826,20 @@ class PCFishMemory:
                         p = b.find(target, pos)
                         if p == -1: break
                         cand = base + offset + p
+                        img_arr = self.read_ptr(cand + 0x28)
+                        txt_timer = self.read_ptr(cand + 0x30)
                         btn = self.read_ptr(cand + 0x40)
-                        list_view = self.read_ptr(cand + 0x38)
                         parent_arr = self.read_ptr(cand + 0x50)
-                        if btn and list_view and parent_arr and 0x10000 <= parent_arr <= 0x7FFFFFFFFFFF:
-                            arr_len = self.read_i32(parent_arr + 0x18)
-                            if arr_len is not None and 0 <= arr_len <= 2:
+                        if btn and txt_timer and parent_arr and 0x10000 <= parent_arr <= 0x7FFFFFFFFFFF:
+                            is_valid = False
+                            if img_arr and 0x10000 <= img_arr <= 0x7FFFFFFFFFFF:
+                                if self.read_i32(img_arr + 0x18) == 5:
+                                    is_valid = True
+                            if not is_valid:
+                                arr_len = self.read_i32(parent_arr + 0x18)
+                                if arr_len is not None and 0 <= arr_len <= 2:
+                                    is_valid = True
+                            if is_valid:
                                 self.uibreed_addr = cand
                                 return cand
 
@@ -815,12 +864,20 @@ class PCFishMemory:
                         if p == -1: break
                         cand = base + offset + p
                         if not (ga_base <= cand <= ga_base + 0x5000000):
+                            img_arr = self.read_ptr(cand + 0x28)
+                            txt_timer = self.read_ptr(cand + 0x30)
                             btn = self.read_ptr(cand + 0x40)
-                            list_view = self.read_ptr(cand + 0x38)
                             parent_arr = self.read_ptr(cand + 0x50)
-                            if btn and list_view and parent_arr and 0x10000 <= parent_arr <= 0x7FFFFFFFFFFF:
-                                arr_len = self.read_i32(parent_arr + 0x18)
-                                if arr_len is not None and 0 <= arr_len <= 2:
+                            if btn and txt_timer and parent_arr and 0x10000 <= parent_arr <= 0x7FFFFFFFFFFF:
+                                is_valid = False
+                                if img_arr and 0x10000 <= img_arr <= 0x7FFFFFFFFFFF:
+                                    if self.read_i32(img_arr + 0x18) == 5:
+                                        is_valid = True
+                                if not is_valid:
+                                    arr_len = self.read_i32(parent_arr + 0x18)
+                                    if arr_len is not None and 0 <= arr_len <= 2:
+                                        is_valid = True
+                                if is_valid:
                                     self.uibreed_addr = cand
                                     return cand
                         pos = p + 8
