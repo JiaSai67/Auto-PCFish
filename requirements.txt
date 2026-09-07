@@ -1,0 +1,2 @@
+psutil>=5.9.0
+capstone>=5.0.0

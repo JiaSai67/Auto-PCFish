@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="45">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>0</ID>
+      <Description>"[核心 v3.0] PC Fish 全自動智能挑選最高級魚配種 (按 F1 啟動 / F2 停止)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+
+dofile([[g:\python\cheatengine\auto_breed.lua]])
+StartAutoBreeder()
+
+{$asm}
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+
+StopAutoBreeder()
+
+{$asm}
+</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>
