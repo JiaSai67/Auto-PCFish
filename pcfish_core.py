@@ -482,7 +482,7 @@ class PCFishMemory:
         fish_list.sort(key=lambda x: (x['grade'], x['level'], x['breed']), reverse=True)
         return fish_list
 
-    def get_best_breed_pair(self, excluded_names=None, ignore_locked=True, ignore_cooldown=True, allow_fallback=False):
+    def get_best_breed_pair(self, excluded_names=None, ignore_locked=True, ignore_cooldown=True, same_rarity_only=False, allow_fallback=True):
         """
         智能配種配對邏輯：
         1. 排除非可用魚：
@@ -490,11 +490,13 @@ class PCFishMemory:
            - is_locked (若 ignore_locked=True)
            - is_cooldown (若 ignore_cooldown=True)
            - excluded_names (使用者指定的黑名單名稱)
-        2. 基本配種邏輯：最多只能配「原始稀有度 + 稀有度-1級」！
-           - 若親代 1 稀有度為 R1，則親代 2 必須滿足 R2 in {R1, R1-1}
-        3. 回退模式：
-           - allow_fallback=False (嚴格保護最高級)：若最高級魚找不到 R1 或 R1-1 的對象，立即中止並報告保護狀態。
-           - allow_fallback=True (自動向下搜尋)：若最高級魚無對象，自動為庫存中次高級的魚尋找符合規則的配對。
+        2. 配種規則判斷：
+           - 若 same_rarity_only=True (只允許同稀有度)：
+             親代 2 必須與親代 1 嚴格相同稀有度 (普通+普通、高級+高級等)，禁止任何跨階配種！
+           - 若 same_rarity_only=False (預設模式)：
+             允許「同階」或「最多差1階」(R1 與 R1-1) 配種。
+        3. 搜尋策略：
+           - 從庫存中最高品質魚隻開始向下尋找最合適的合法組合。
         回傳: (p1, p2, status_msg)
         """
         if excluded_names is None:
@@ -528,35 +530,30 @@ class PCFishMemory:
                 return None, None, f"⏳ 魚隻冷卻中：[{first_cd['rarity']} {first_cd['name']}] 尚需等待 {mm:02d}:{ss:02d}，暫停循環等待冷卻完畢"
             return None, None, f"可用魚隻不足 2 條 (符合條件剩餘: {len(available)} 條，可能被鎖定或排除)"
 
-        # 1. 嚴格模式：親代 1 鎖定最高級可用魚隻
-        if not allow_fallback:
-            p1 = available[0]
-            r1 = p1['grade']
-            allowed_grades = {r1, max(0, r1 - 1)}
+        # 模式 1：只允許同稀有度繁殖 (嚴格禁止跨階)
+        if same_rarity_only:
+            for i in range(len(available)):
+                cand1 = available[i]
+                r1 = cand1['grade']
+                for j in range(i + 1, len(available)):
+                    cand2 = available[j]
+                    if cand2['grade'] == r1:
+                        return cand1, cand2, ""
 
-            p2 = None
-            for cand in available[1:]:
-                if cand['grade'] in allowed_grades:
-                    p2 = cand
-                    break
-
-            if not p2:
-                r1_name = RARITY_MAP.get(r1, f"{r1}級")
-                min_r_name = RARITY_MAP.get(max(0, r1 - 1), f"{r1-1}級")
-                # 檢查是否有同階或次階魚正在冷卻中
-                cd_cands = [f for f in all_fish if f['can_breed'] and f['grade'] in allowed_grades and f['is_cooldown'] and f['id'] != p1['id']]
+            # 若無可用同階組合，檢查是否有同階魚正在冷卻中
+            for cand1 in available:
+                r1 = cand1['grade']
+                cd_cands = [f for f in all_fish if f['can_breed'] and f['grade'] == r1 and f['is_cooldown'] and f['id'] != cand1['id'] and f['name'] not in excluded_names]
                 if cd_cands:
                     min_cd = min(f['cd_remain'] for f in cd_cands)
                     cd_fish = next(f for f in cd_cands if f['cd_remain'] == min_cd)
                     mm = min_cd // 60
                     ss = min_cd % 60
-                    return p1, None, f"⏳ 等待冷卻：親代 1 [{r1_name}] 的合適配對對象 [{cd_fish['rarity']} {cd_fish['name']}] 仍在冷卻中 (剩餘 {mm:02d}:{ss:02d})"
+                    return None, None, f"⏳ 等待同階冷卻：[{cand1['rarity']} {cand1['name']}] 的同稀有度對象 [{cd_fish['name']}] 仍在冷卻中 (剩餘 {mm:02d}:{ss:02d})"
 
-                return p1, None, f"保護機制生效：親代 1 為 [{r1_name}]，但庫存中無 [{r1_name}] 或 [{min_r_name}] 的可用配對對象！"
+            return None, None, "保護機制生效：已開啟「只允許同稀有度繁殖」，庫存中無任何可成對的同階可用魚隻！"
 
-            return p1, p2, ""
-
-        # 2. 彈性模式 (allow_fallback=True)：從最高品質開始向下尋找最佳合法組合
+        # 模式 2：預設配種邏輯 (同階 或 最多差 1 階)
         for i in range(len(available)):
             cand1 = available[i]
             r1 = cand1['grade']
@@ -565,6 +562,18 @@ class PCFishMemory:
                 cand2 = available[j]
                 if cand2['grade'] in allowed_grades:
                     return cand1, cand2, ""
+
+        # 若無可用組合，檢查是否有冷卻中的同階或次階魚
+        for cand1 in available:
+            r1 = cand1['grade']
+            allowed_grades = {r1, max(0, r1 - 1)}
+            cd_cands = [f for f in all_fish if f['can_breed'] and f['grade'] in allowed_grades and f['is_cooldown'] and f['id'] != cand1['id'] and f['name'] not in excluded_names]
+            if cd_cands:
+                min_cd = min(f['cd_remain'] for f in cd_cands)
+                cd_fish = next(f for f in cd_cands if f['cd_remain'] == min_cd)
+                mm = min_cd // 60
+                ss = min_cd % 60
+                return None, None, f"⏳ 等待冷卻：[{cand1['rarity']} {cand1['name']}] 的合適配對對象 [{cd_fish['rarity']} {cd_fish['name']}] 仍在冷卻中 (剩餘 {mm:02d}:{ss:02d})"
 
         return None, None, "保護機制生效：庫存中無任何符合「最多差1階」配種規則的可用組合！"
 

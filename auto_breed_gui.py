@@ -19,9 +19,9 @@ from pcfish_core import PCFishMemory, RARITY_MAP
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖管理終端 v3.5 PRO")
-        self.root.geometry("740x940")
-        self.root.minsize(680, 780)
+        self.root.title("PC Fish 智能繁殖管理終端 v1.0.1 PRO")
+        self.root.geometry("720x820")
+        self.root.minsize(680, 680)
         self.root.configure(bg="#181825")
 
         # 核心記憶體引擎
@@ -35,13 +35,10 @@ class AutoBreedApp:
         self.cached_target_ts = 0
         self.fish_local_cd = {} # 本地魚隻冷卻時間戳快取 {fish_id: target_ts}
 
-        # 策略過濾與偏好設定
+        # 策略過濾與偏好設定 (簡化介面，其餘選項預設開啟)
         self.blacklist = set()
-        self.opt_ignore_locked = tk.BooleanVar(value=True)
-        self.opt_ignore_cooldown = tk.BooleanVar(value=True)
-        self.opt_allow_fallback = tk.BooleanVar(value=False)
-        self.opt_memory_signal = tk.BooleanVar(value=True)
         self.opt_min_hearts = tk.IntVar(value=1)
+        self.opt_same_rarity_only = tk.BooleanVar(value=False)
         self.ontop_var = tk.BooleanVar(value=True)
 
         # 樣式與視覺系統
@@ -138,7 +135,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="PRO v3.5",
+            text="PRO v1.0.1",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
@@ -229,56 +226,7 @@ class AutoBreedApp:
         self.metric_wake = self.create_metric_pill(metrics_box, "下次生成時間", "--:--:--", self.c_gold)
 
         # ==========================================
-        # 3. 最優親代配對看板 (Recommendation Card)
-        # ==========================================
-        pair_card = tk.Frame(self.root, bg=self.c_card, highlightthickness=1, highlightbackground=self.c_border)
-        pair_card.pack(fill="x", padx=18, pady=4)
-
-        pair_header = tk.Frame(pair_card, bg=self.c_card)
-        pair_header.pack(fill="x", padx=14, pady=(8, 2))
-
-        lbl_pair_title = tk.Label(
-            pair_header,
-            text="🏆 智能推薦最佳親代配對",
-            font=self.font_header,
-            fg=self.c_gold,
-            bg=self.c_card
-        )
-        lbl_pair_title.pack(side="left")
-
-        lbl_rule_tag = tk.Label(
-            pair_header,
-            text="門檻: 嚴格同階或差1階 (R 與 R-1)",
-            font=self.font_small,
-            fg=self.c_subtext,
-            bg=self.c_border,
-            padx=6,
-            pady=1
-        )
-        lbl_rule_tag.pack(side="right")
-
-        self.lbl_p1 = tk.Label(
-            pair_card,
-            text="親代 1: 正在比對庫存中...",
-            font=self.font_bold,
-            fg=self.c_green,
-            bg=self.c_card,
-            anchor="w"
-        )
-        self.lbl_p1.pack(fill="x", padx=16, pady=2)
-
-        self.lbl_p2 = tk.Label(
-            pair_card,
-            text="親代 2: 正在比對庫存中...",
-            font=self.font_bold,
-            fg=self.c_purple,
-            bg=self.c_card,
-            anchor="w"
-        )
-        self.lbl_p2.pack(fill="x", padx=16, pady=(2, 8))
-
-        # ==========================================
-        # 4. 操作控制中心 (Action Hub - 雙大按鈕)
+        # 3. 操作控制中心 (Action Hub - 雙大按鈕)
         # ==========================================
         action_bar = tk.Frame(self.root, bg=self.c_bg)
         action_bar.pack(fill="x", padx=18, pady=4)
@@ -316,21 +264,21 @@ class AutoBreedApp:
         self.btn_toggle.pack(side="right", fill="x", expand=True)
 
         # ==========================================
-        # 5. 偏好過濾與愛心門檻設定 (Settings Card)
+        # 4. 繁殖策略與門檻設定 (Settings Card)
         # ==========================================
         opt_card = tk.Frame(self.root, bg=self.c_card, highlightthickness=1, highlightbackground=self.c_border)
         opt_card.pack(fill="x", padx=18, pady=4)
 
         lbl_opt_title = tk.Label(
             opt_card,
-            text="⚙️ 繁殖策略與門檻過濾設定",
+            text="⚙️ 繁殖策略設定",
             font=self.font_header,
             fg=self.c_cyan,
             bg=self.c_card
         )
         lbl_opt_title.pack(anchor="w", padx=14, pady=(8, 4))
 
-        # 第一列：愛心門檻與基礎過濾
+        # 第一列：愛心門檻 + 只允許同稀有度繁殖
         row1 = tk.Frame(opt_card, bg=self.c_card)
         row1.pack(fill="x", padx=14, pady=(0, 4))
 
@@ -345,73 +293,30 @@ class AutoBreedApp:
             textvariable=self.opt_min_hearts,
             font=self.font_bold
         )
-        spin_hearts.pack(side="left", padx=(0, 10))
+        spin_hearts.pack(side="left", padx=(0, 14))
 
-        cb_lock = tk.Checkbutton(
+        cb_same_rarity = tk.Checkbutton(
             row1,
-            text="排除鎖定 🔒",
-            variable=self.opt_ignore_locked,
+            text="🔒 只允許同稀有度繁殖 (禁止跨階配對，僅同階如普通+普通、高級+高級)",
+            variable=self.opt_same_rarity_only,
             bg=self.c_card,
             fg=self.c_text,
             selectcolor=self.c_entry_bg,
             activebackground=self.c_card,
             activeforeground=self.c_gold,
-            font=self.font_small
-        )
-        cb_lock.pack(side="left", padx=(0, 8))
-
-        cb_cd = tk.Checkbutton(
-            row1,
-            text="排除冷卻 ⏳",
-            variable=self.opt_ignore_cooldown,
-            bg=self.c_card,
-            fg=self.c_text,
-            selectcolor=self.c_entry_bg,
-            activebackground=self.c_card,
-            activeforeground=self.c_cyan,
-            font=self.font_small
-        )
-        cb_cd.pack(side="left", padx=(0, 8))
-
-        cb_fallback = tk.Checkbutton(
-            row1,
-            text="向下相容組合",
-            variable=self.opt_allow_fallback,
-            bg=self.c_card,
-            fg=self.c_text,
-            selectcolor=self.c_entry_bg,
-            activebackground=self.c_card,
-            activeforeground=self.c_purple,
-            font=self.font_small
-        )
-        cb_fallback.pack(side="left")
-
-        # 第二列：原生訊號直發
-        row2 = tk.Frame(opt_card, bg=self.c_card)
-        row2.pack(fill="x", padx=14, pady=(0, 4))
-
-        cb_signal = tk.Checkbutton(
-            row2,
-            text="⚡ 純記憶體原生訊號直發 (免移滑鼠 / 不搶焦點 / 支援視窗最小化)",
-            variable=self.opt_memory_signal,
-            bg=self.c_card,
-            fg=self.c_green,
-            selectcolor=self.c_entry_bg,
-            activebackground=self.c_card,
-            activeforeground=self.c_cyan,
             font=self.font_bold
         )
-        cb_signal.pack(side="left")
+        cb_same_rarity.pack(side="left")
 
-        # 第三列：避免魚種 (黑名單)
-        row3 = tk.Frame(opt_card, bg=self.c_card)
-        row3.pack(fill="x", padx=14, pady=(2, 4))
+        # 第二列：避免魚種 (黑名單)
+        row2 = tk.Frame(opt_card, bg=self.c_card)
+        row2.pack(fill="x", padx=14, pady=(2, 4))
 
-        lbl_bl = tk.Label(row3, text="🚫 避免魚種:", font=self.font_bold, fg=self.c_pink, bg=self.c_card)
+        lbl_bl = tk.Label(row2, text="🚫 避免魚種:", font=self.font_bold, fg=self.c_pink, bg=self.c_card)
         lbl_bl.pack(side="left", padx=(0, 6))
 
         self.blacklist_entry = tk.Entry(
-            row3,
+            row2,
             bg=self.c_entry_bg,
             fg=self.c_text,
             insertbackground="white",
@@ -423,7 +328,7 @@ class AutoBreedApp:
         self.blacklist_entry.bind("<Return>", lambda e: self.apply_blacklist_from_entry())
 
         btn_apply_bl = tk.Button(
-            row3,
+            row2,
             text="套用",
             font=self.font_small,
             bg=self.c_border,
@@ -439,7 +344,7 @@ class AutoBreedApp:
         btn_apply_bl.pack(side="left", padx=(0, 4))
 
         btn_clear_bl = tk.Button(
-            row3,
+            row2,
             text="清空",
             font=self.font_small,
             bg=self.c_border,
@@ -456,7 +361,7 @@ class AutoBreedApp:
 
         lbl_tip = tk.Label(
             opt_card,
-            text="💡 提示：在下方魚庫表格【雙擊】或【右鍵】可快速將選中魚種加入/移出避免名單。",
+            text="💡 提示：排除鎖定/冷卻與原生記憶體直發已預設啟用。雙擊下方魚庫表格可快速將選中魚種加入/移出避免名單。",
             font=self.font_small,
             fg=self.c_subtext,
             bg=self.c_card
@@ -743,34 +648,13 @@ class AutoBreedApp:
                 fish_list = self.mem.get_all_fish()
                 self.lbl_list_title.configure(text=f"📋 魚庫即時清單 (總數: x{len(fish_list)} · 持續監控中)")
 
-                # 計算當前最佳配對推薦
+                # 計算當前最佳配對推薦 (傳遞至表格以差量就地更新 親代1/2 標籤)
                 p1, p2, err_msg = self.mem.get_best_breed_pair(
                     excluded_names=self.blacklist,
-                    ignore_locked=self.opt_ignore_locked.get(),
-                    ignore_cooldown=self.opt_ignore_cooldown.get(),
-                    allow_fallback=self.opt_allow_fallback.get()
+                    ignore_locked=True,
+                    ignore_cooldown=True,
+                    same_rarity_only=self.opt_same_rarity_only.get()
                 )
-
-                if p1:
-                    lock_tag = " [🔒]" if p1['is_locked'] else ""
-                    self.lbl_p1.configure(
-                        text=f"親代 1: ⭐ [{p1['rarity']} {p1['stars']}] {p1['name']}{lock_tag} (剩餘: {p1['breed']}/{p1['breed_max']}次)",
-                        fg=self.c_green
-                    )
-                else:
-                    self.lbl_p1.configure(text="親代 1: 暫無符合條件的可用魚隻", fg=self.c_subtext)
-
-                if p2:
-                    lock_tag = " [🔒]" if p2['is_locked'] else ""
-                    self.lbl_p2.configure(
-                        text=f"親代 2: ⭐ [{p2['rarity']} {p2['stars']}] {p2['name']}{lock_tag} (剩餘: {p2['breed']}/{p2['breed_max']}次)",
-                        fg=self.c_purple
-                    )
-                else:
-                    self.lbl_p2.configure(
-                        text=f"親代 2: 🛡️ {err_msg if err_msg else '無可用配對對象'}",
-                        fg=self.c_gold
-                    )
 
                 # 核心需求 2：以差量就地更新表格，完全杜絕整表重新整理造成的閃爍
                 self.update_fish_tree_in_place(fish_list, p1, p2)
@@ -813,9 +697,9 @@ class AutoBreedApp:
 
                 p1, p2, err_msg = self.mem.get_best_breed_pair(
                     excluded_names=self.blacklist,
-                    ignore_locked=self.opt_ignore_locked.get(),
-                    ignore_cooldown=self.opt_ignore_cooldown.get(),
-                    allow_fallback=self.opt_allow_fallback.get()
+                    ignore_locked=True,
+                    ignore_cooldown=True,
+                    same_rarity_only=self.opt_same_rarity_only.get()
                 )
 
                 if not p1 or not p2:
@@ -825,7 +709,7 @@ class AutoBreedApp:
                 self.log(f"【單次鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送繁殖訊號...")
 
                 # 執行單次繁殖並等待伺服端冷卻握手確認
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=self.opt_memory_signal.get(), wait_confirm=True)
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
@@ -917,9 +801,9 @@ class AutoBreedApp:
 
                 p1, p2, err_msg = self.mem.get_best_breed_pair(
                     excluded_names=self.blacklist,
-                    ignore_locked=self.opt_ignore_locked.get(),
-                    ignore_cooldown=self.opt_ignore_cooldown.get(),
-                    allow_fallback=self.opt_allow_fallback.get()
+                    ignore_locked=True,
+                    ignore_cooldown=True,
+                    same_rarity_only=self.opt_same_rarity_only.get()
                 )
 
                 if not p1 or not p2:
@@ -930,7 +814,7 @@ class AutoBreedApp:
                 self.log(f"【自動配種】挑選配對: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送繁殖訊號...")
 
                 # 觸發實際遊戲配種 (純記憶體原生訊號直發，並嚴格等待伺服端冷卻握手確認！)
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=self.opt_memory_signal.get(), wait_confirm=True)
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
