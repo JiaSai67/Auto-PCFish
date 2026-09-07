@@ -395,16 +395,48 @@ class PCFishMemory:
                         cand = base + offset + p
                         hearts = self.read_i32(cand + 0x40)
                         fl = self.read_ptr(cand + 0x68)
-                        if hearts is not None and 0 <= hearts <= 10 and fl and 0x10000000000 <= fl <= 0x7FFFFFFFFFFF:
+                        if hearts is not None and 0 <= hearts <= 10 and fl and 0x10000 <= fl <= 0x7FFFFFFFFFFF:
                             count = self.read_i32(fl + 0x18)
                             items = self.read_ptr(fl + 0x10)
                             if count is not None and 0 <= count <= 5000 and items:
                                 self.gamedata_addr = cand
                                 return cand
+
+                        pos = p + 8
+            addr = base + size
+            if addr >= 0x7FFFFFFFFFFF: break
+
+        # 3. 降級備用路徑：若作業系統堆未標記為 MEM_PRIVATE，則全範圍掃描已提交記憶體
+        addr = 0
+        ga_base = self.get_module_base("GameAssembly.dll") or 0
+        while kernel32.VirtualQueryEx(self.h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize
+            if mbi.State == MEM_COMMIT and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
+                chunk_size = 65536
+                for offset in range(0, size, chunk_size):
+                    to_read = min(chunk_size + 8, size - offset)
+                    b = self.read_bytes(base + offset, to_read)
+                    pos = 0
+                    while True:
+                        p = b.find(target, pos)
+                        if p == -1: break
+                        cand = base + offset + p
+                        # 避開 GameAssembly.dll 模組內部（排除型別元數據自引用）
+                        if not (ga_base <= cand <= ga_base + 0x5000000):
+                            hearts = self.read_i32(cand + 0x40)
+                            fl = self.read_ptr(cand + 0x68)
+                            if hearts is not None and 0 <= hearts <= 10 and fl and 0x10000 <= fl <= 0x7FFFFFFFFFFF:
+                                count = self.read_i32(fl + 0x18)
+                                items = self.read_ptr(fl + 0x10)
+                                if count is not None and 0 <= count <= 5000 and items:
+                                    self.gamedata_addr = cand
+                                    return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
         return None
+
 
     def get_heart_interval(self):
         """動態讀取遊戲每顆愛心恢復秒數 (預設 420.0 秒 / 7分鐘)"""
@@ -756,15 +788,46 @@ class PCFishMemory:
                         btn = self.read_ptr(cand + 0x40)
                         list_view = self.read_ptr(cand + 0x38)
                         parent_arr = self.read_ptr(cand + 0x50)
-                        if btn and list_view and parent_arr and 0x10000000000 <= parent_arr <= 0x7FFFFFFFFFFF:
+                        if btn and list_view and parent_arr and 0x10000 <= parent_arr <= 0x7FFFFFFFFFFF:
                             arr_len = self.read_i32(parent_arr + 0x18)
                             if arr_len is not None and 0 <= arr_len <= 2:
                                 self.uibreed_addr = cand
                                 return cand
+
+                        pos = p + 8
+            addr = base + size
+            if addr >= 0x7FFFFFFFFFFF: break
+
+        # 3. 降級備用路徑：若作業系統堆未標記為 MEM_PRIVATE，則全範圍掃描已提交記憶體
+        addr = 0
+        ga_base = self.get_module_base("GameAssembly.dll") or 0
+        while kernel32.VirtualQueryEx(self.h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize
+            if mbi.State == MEM_COMMIT and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
+                chunk_size = 65536
+                for offset in range(0, size, chunk_size):
+                    to_read = min(chunk_size + 8, size - offset)
+                    b = self.read_bytes(base + offset, to_read)
+                    pos = 0
+                    while True:
+                        p = b.find(target, pos)
+                        if p == -1: break
+                        cand = base + offset + p
+                        if not (ga_base <= cand <= ga_base + 0x5000000):
+                            btn = self.read_ptr(cand + 0x40)
+                            list_view = self.read_ptr(cand + 0x38)
+                            parent_arr = self.read_ptr(cand + 0x50)
+                            if btn and list_view and parent_arr and 0x10000 <= parent_arr <= 0x7FFFFFFFFFFF:
+                                arr_len = self.read_i32(parent_arr + 0x18)
+                                if arr_len is not None and 0 <= arr_len <= 2:
+                                    self.uibreed_addr = cand
+                                    return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
         return None
+
 
     def set_breed_parents(self, p1, p2):
         """將挑選出的親代 100% 寫入遊戲 UIBreed 記憶體槽位中"""
