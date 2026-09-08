@@ -233,6 +233,8 @@ class PCFishMemory:
         self.fish_model_klass = None
         self.uibreed_klass = None
         self.uibreed_addr = None
+        self.uimerge_klass = None
+        self.uimerge_addr = None
         self._il2cpp_exports = None
 
     def read_bytes(self, addr, size):
@@ -1583,46 +1585,76 @@ class PCFishMemory:
         kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
         return True, "調用成功"
 
+    def create_managed_string(self, text):
+        """在遊戲記憶體中動態建立標準託管 System.String 物件"""
+        if not text:
+            return 0
+        raw = text.encode('utf-16le') + b'\x00\x00'
+        if not hasattr(self, '_string_klass') or not self._string_klass:
+            all_f = self.get_all_fish()
+            if all_f and all_f[0].get('idPtr'):
+                self._string_klass = self.read_ptr(all_f[0]['idPtr'])
+
+        buf = kernel32.VirtualAllocEx(self.h_proc, None, 0x20 + len(raw), 0x3000, 0x04)
+        if not buf:
+            return 0
+        if getattr(self, '_string_klass', 0):
+            self.write_ptr(buf, self._string_klass)
+        self.write_i32(buf + 0x10, len(text))
+        self.write_bytes(buf + 0x14, raw)
+        return buf
+
     def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
         """
         純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
         1. 定位 UIMerge 物件 (嚴格多重指標檢驗)
-        2. 原生調用 ResetParent 清空並重設介面 (確保 viewMerge 處於 Active 狀態)
-        3. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8) 與 targetStar (+0xc8)
-        4. 依序原生調用 SetParent(fishId) 注入 10 隻材料魚，由遊戲原生完成槽位綁定與預測更新
-        5. 原生調用 UIMerge.Merge() 發送網路合成封包
-        6. 等候伺服端完成後，原生調用 ResetParent 恢復乾淨介面，徹底杜絕畫面卡死
+        2. 原生調用 MergeInit() 清空槽位並配置全新 string[10] (零彈窗、零畫面卡死)
+        3. 直接將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
+        4. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與 fishType (+0xc0)
+           若為一般融合 (merge_type == 0)，配置 mergeType=0, fishType=0, grade=0
+        5. 原生調用 UpdateMergeCount() 刷新介面計數為 10 / 10
+        6. 原生調用 UIMerge.Merge() 發送網路合成封包 (直接送往伺服端，不經任何 UI 彈窗攔截)
+        7. 等候 1.5 秒伺服端結算後，原生調用 MergeInit() 恢復初始乾淨狀態
         """
         u = self.locate_uimerge()
         if not u:
-            return False, "無法定位遊戲 UIMerge 實例 (請確認遊戲內已打開「合成」面板)"
+            return False, "無法定位遊戲 UIMerge 實例 (請先在遊戲中打開「合成」介面)"
 
         if len(fish_list_10) != 10:
             return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
 
         k = self.read_ptr(u)
-        mi_reset = self.get_class_method(k, "ResetParent")
-        mi_setparent = self.get_class_method(k, "SetParent")
+        mi_init = self.get_class_method(k, "MergeInit")
+        mi_update = self.get_class_method(k, "UpdateMergeCount")
         mi_merge = self.get_class_method(k, "Merge")
 
-        # 備援：若動態方法名未取到，由虛擬表固定 offset 回退
-        if not (mi_reset and mi_setparent and mi_merge):
+        if not (mi_init and mi_merge):
             methods_ptr = self.read_ptr(k + 0x98)
             if methods_ptr:
-                mi_reset = mi_reset or self.read_ptr(methods_ptr + 10 * 8)
-                mi_setparent = mi_setparent or self.read_ptr(methods_ptr + 11 * 8)
+                mi_init = mi_init or self.read_ptr(methods_ptr + 7 * 8)
+                mi_update = mi_update or self.read_ptr(methods_ptr + 8 * 8)
                 mi_merge = mi_merge or self.read_ptr(methods_ptr + 14 * 8)
 
-        if not (mi_reset and mi_setparent and mi_merge):
-            return False, "無法讀取 UIMerge 原生函式表 (ResetParent/SetParent/Merge)"
+        if not (mi_init and mi_merge):
+            return False, "無法讀取 UIMerge 原生函式表 (MergeInit/Merge)"
 
-        # 1. 先重置槽位與介面
-        self.invoke_il2cpp_method(mi_reset, u)
+        # 1. 先透過官方 MergeInit 清空槽位與介面 (絕無 msg_autoFillClear 彈窗干擾)
+        self.invoke_il2cpp_method(mi_init, u)
 
-        # 2. 設置合成型態 (賽季合成需設置 mergeType 與 targetStar)
+        # 2. 直接向 mergeFishList (u + 0x78, String[10]) 寫入 10 個材料魚之合法字串指標
+        p78 = self.read_ptr(u + 0x78)
+        if not p78 or not (0x10000 <= p78 <= 0x7FFFFFFFFFFF):
+            return False, "無法獲取 mergeFishList 記憶體陣列"
+
+        for idx, f in enumerate(fish_list_10):
+            self.write_ptr(p78 + 0x20 + idx * 8, f['idPtr'])
+
+        # 3. 設置合成型態 (賽季合成 vs 一般融合)
         self.write_i32(u + 0xb8, merge_type)
         if merge_type == 1:
             self.write_i32(u + 0xc8, target_star)
+            # 尋找 target_season_type 對應的合規字串指標
+            season_str_ptr = 0
             gdm = self.locate_gamedata_manager()
             if gdm:
                 d_ptr = self.read_ptr(gdm + 0x58)
@@ -1633,26 +1665,35 @@ class PCFishMemory:
                         e_addr = entries + 0x20 + idx * 24
                         k_ptr = self.read_ptr(e_addr + 8)
                         if self.read_utf16_str(k_ptr) == target_season_type:
-                            val_ptr = self.read_ptr(e_addr + 16)
-                            self.write_ptr(u + 0xc0, val_ptr)
+                            season_str_ptr = k_ptr
                             break
+            if not season_str_ptr:
+                season_str_ptr = self.create_managed_string(target_season_type)
+
+            # UIMerge.Merge 中 [rdi + 0xc0] + 0x10 為 string 指針
+            if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
+                self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
+            if self._season_dummy_obj and season_str_ptr:
+                self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
+                self.write_ptr(u + 0xc0, self._season_dummy_obj)
         else:
             self.write_ptr(u + 0xc0, 0)
             self.write_i32(u + 0xc8, 0)
 
-        # 3. 依序將 10 隻材料魚透過 SetParent 注入槽位 (原生自動更新槽位、預覽與計數)
-        for f in fish_list_10:
-            self.invoke_il2cpp_method(mi_setparent, u, [f['idPtr']])
+        # 4. 原生調用 UpdateMergeCount 刷新介面 (顯示 10 / 10 就緒)
+        if mi_update:
+            self.invoke_il2cpp_method(mi_update, u)
 
-        # 4. 調用 Merge 發送核心合成訊號
+        # 5. 調用 Merge 發送核心合成訊號 (直接送出網路封包，零 UI 阻擋)
         ok, msg = self.invoke_il2cpp_method(mi_merge, u)
         if not ok:
             return False, f"合成發送失敗: {msg}"
 
-        # 5. 等候 1.2 秒後重置介面，確保 viewMerge 恢復可見、杜絕畫面卡死
-        time.sleep(1.2)
-        self.invoke_il2cpp_method(mi_reset, u)
+        # 6. 等候 1.5 秒伺服端完成後，原生調用 MergeInit 清理槽位
+        time.sleep(1.5)
+        self.invoke_il2cpp_method(mi_init, u)
 
         type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
         return True, f"★ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"
+
 
