@@ -245,6 +245,18 @@ class PCFishMemory:
     def write_ptr(self, addr, val):
         return self.write_bytes(addr, struct.pack('<Q', val))
 
+    def write_i32(self, addr, val):
+        """寫入 32 位元有符號整數 (Little-Endian Signed 32-bit Integer)"""
+        return self.write_bytes(addr, struct.pack('<i', int(val)))
+
+    def write_u32(self, addr, val):
+        """寫入 32 位元無符號整數 (Little-Endian Unsigned 32-bit Integer)"""
+        return self.write_bytes(addr, struct.pack('<I', int(val)))
+
+    def write_i64(self, addr, val):
+        """寫入 64 位元有符號整數 (Little-Endian Signed 64-bit Integer)"""
+        return self.write_bytes(addr, struct.pack('<q', int(val)))
+
     def read_i32(self, addr):
         b = self.read_bytes(addr, 4)
         return struct.unpack('<i', b)[0] if len(b) == 4 else 0
