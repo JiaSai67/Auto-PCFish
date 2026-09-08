@@ -35,7 +35,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.0 STABLE (混合安全模式)")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.1 STABLE (純記憶體直發)")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -968,9 +968,9 @@ class AutoBreedApp:
                     self.log(f"【單次中止】{err_msg}")
                     return
 
-                self.log(f"【單次鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送繁殖訊號...")
+                self.log(f"【單次鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送純記憶體繁殖訊號...")
 
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=False, wait_confirm=True)
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
@@ -1010,7 +1010,7 @@ class AutoBreedApp:
                 activebackground="#eba0ac",
                 activeforeground="#181825"
             )
-            self.log("【啟動】全自動智能繁殖流程已開啟！(混合安全模式: 100% 記憶體親代注入 + 主線程安全觸發)")
+            self.log("【啟動】全自動智能繁殖流程已開啟！(100% 純記憶體訊號直發模式)")
             self.autobread_thread = threading.Thread(target=self.autobread_loop, daemon=True)
             self.autobread_thread.start()
         else:
@@ -1066,8 +1066,8 @@ class AutoBreedApp:
 
                 self.log(f"【智能鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}] (剩餘次數: {p1['breed']}/{p2['breed']})，發送繁殖訊號...")
 
-                # 關鍵修復：預設採用混合安全模式 (use_memory_signal=False)，避開 Unity Graphics device is null 崩潰
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=False, wait_confirm=True)
+                # 100% 純記憶體訊號直發 (v1.0.7/v1.0.8 穩定架構)
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
