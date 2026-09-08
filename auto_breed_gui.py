@@ -1,5 +1,5 @@
 """
-PC Fish 智能繁殖管理終端 v1.0.3 PRO
+PC Fish 智能繁殖管理終端 v1.0.4 PRO
 - 依照 Impeccable (Operate Mode) 與 AI Tool Standard 規範全新重構
 - 100% 記憶體直讀 GameDataManager (愛心數量、倒數計時、魚隻列表)
 - 魚種冷卻時間全面導入本地 Windows 時間戳登記與平滑倒數
@@ -19,7 +19,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖管理終端 v1.0.3 PRO")
+        self.root.title("PC Fish 智能繁殖管理終端 v1.0.4 PRO")
         self.root.geometry("720x820")
         self.root.minsize(680, 680)
         self.root.configure(bg="#181825")
@@ -135,7 +135,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="PRO v1.0.3",
+            text="PRO v1.0.4",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
