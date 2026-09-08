@@ -12,6 +12,18 @@ PC Fish 智能繁殖與合成管理終端 v1.0.5 PRO
 - 🌟 純記憶體原生直發合成/融合訊號 (直調 UIMerge.Merge，背景靜默執行)
 """
 
+import sys
+import os
+
+# Windows CP950 終端編碼保護 (杜絕 UnicodeEncodeError 閃退)
+if sys.platform == "win32":
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
@@ -22,7 +34,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.0.5 PRO")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.0.7 STABLE")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -156,7 +168,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="PRO v1.0.6",
+            text="v1.0.7 STABLE",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
@@ -792,7 +804,7 @@ class AutoBreedApp:
         status_list = class_res.get('season_status', [])
         for item in status_list:
             iid = f"{item['target_type']}_{item['target_star']}"
-            star_str = "✦" * item['target_star']
+            star_str = "★" * item['target_star']
             missing_str = ", ".join(item['missing']) if item['missing'] else "材料齊全 ✨ (隨時可合成)"
             status_text = "【可合成!】" if item['is_ready'] else (f"籌備中 ({item['progress']})" if item['progress_val'] > 0 else "未開始")
             vals = (

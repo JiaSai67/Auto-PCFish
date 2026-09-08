@@ -7,6 +7,7 @@ PC Fish 記憶體讀取與智能配種核心模組 v3.0
 - 支援使用者自訂「避免的魚種（黑名單）」過濾
 """
 
+import sys
 import ctypes
 from ctypes import wintypes
 import struct
@@ -14,6 +15,16 @@ import time
 import datetime
 import json
 import os
+
+# Windows CP950 終端編碼保護 (杜絕 UnicodeEncodeError 閃退)
+if sys.platform == "win32":
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
 
 def parse_cooldown_datetime(s):
     """
@@ -680,7 +691,7 @@ class PCFishMemory:
                         if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= grade <= 10):
                             disp_name = get_fish_display_name(fish_code, id_str)
                             rarity_name = RARITY_MAP.get(grade, f"等級{grade}")
-                            stars_icon = "✦" * max(1, level) if not is_basic else "-"
+                            stars_icon = "★" * max(1, level) if not is_basic else "-"
 
                             fish_list.append({
                                 "ptr": f_addr,
@@ -762,7 +773,7 @@ class PCFishMemory:
                         if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= grade <= 10):
                             disp_name = get_fish_display_name(fish_code, id_str)
                             rarity_name = RARITY_MAP.get(grade, f"等級{grade}")
-                            stars_icon = "✦" * max(1, level) if not is_basic else "-"
+                            stars_icon = "★" * max(1, level) if not is_basic else "-"
 
                             fish_list.append({
                                 "ptr": f_addr,
@@ -1344,8 +1355,17 @@ class PCFishMemory:
                 pids = self.read_ptr(self.uimerge_addr + 0x78)
                 craft = self.read_ptr(self.uimerge_addr + 0x80)
                 btn = self.read_ptr(self.uimerge_addr + 0x60)
-                if slots and pids and craft and btn:
-                    return self.uimerge_addr
+                if (0x10000 <= slots <= 0x7FFFFFFFFFFF and 
+                    0x10000 <= pids <= 0x7FFFFFFFFFFF and 
+                    0x10000 <= craft <= 0x7FFFFFFFFFFF and 
+                    0x10000 <= btn <= 0x7FFFFFFFFFFF):
+                    # 核心特徵：slots 陣列長度必定為 10
+                    if self.read_i32(slots + 0x18) == 10:
+                        pids_len = self.read_i32(pids + 0x18)
+                        if 0 <= pids_len <= 10:
+                            slot0 = self.read_ptr(slots + 0x20)
+                            if 0x10000 <= slot0 <= 0x7FFFFFFFFFFF:
+                                return self.uimerge_addr
 
         if not self.uimerge_klass:
             self.resolve_il2cpp_classes()
@@ -1372,11 +1392,17 @@ class PCFishMemory:
                         pids = self.read_ptr(cand + 0x78)
                         craft = self.read_ptr(cand + 0x80)
                         btn = self.read_ptr(cand + 0x60)
-                        if slots and pids and craft and btn and 0x10000 <= slots <= 0x7FFFFFFFFFFF and 0x10000 <= pids <= 0x7FFFFFFFFFFF:
-                            pids_size = self.read_i32(pids + 0x18)
-                            if 0 <= pids_size <= 10:
-                                self.uimerge_addr = cand
-                                return cand
+                        if (0x10000 <= slots <= 0x7FFFFFFFFFFF and 
+                            0x10000 <= pids <= 0x7FFFFFFFFFFF and 
+                            0x10000 <= craft <= 0x7FFFFFFFFFFF and 
+                            0x10000 <= btn <= 0x7FFFFFFFFFFF):
+                            if self.read_i32(slots + 0x18) == 10:
+                                pids_len = self.read_i32(pids + 0x18)
+                                if 0 <= pids_len <= 10:
+                                    slot0 = self.read_ptr(slots + 0x20)
+                                    if 0x10000 <= slot0 <= 0x7FFFFFFFFFFF:
+                                        self.uimerge_addr = cand
+                                        return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
@@ -1560,11 +1586,12 @@ class PCFishMemory:
     def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
         """
         純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
-        1. 定位 UIMerge 物件
-        2. 動態解析 UIMerge.Merge 方法指針 (零下標誤差)
-        3. 直接將 10 隻材料魚注入 mergeFishList (+0x78, List<string>) 與 listViewItem (+0x40, UI槽位)
-        4. 依合成類型配置 mergeType (+0xb8)、fishType (+0xc0，合法字串指標) 與 grade (+0xc8)
-        5. 原生調用 UIMerge.Merge() 發送網路合成封包 (絕不調用 AutoParent / ResetParent，徹底杜絕彈窗與畫面卡死)
+        1. 定位 UIMerge 物件 (嚴格多重指標檢驗)
+        2. 原生調用 ResetParent 清空並重設介面 (確保 viewMerge 處於 Active 狀態)
+        3. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8) 與 targetStar (+0xc8)
+        4. 依序原生調用 SetParent(fishId) 注入 10 隻材料魚，由遊戲原生完成槽位綁定與預測更新
+        5. 原生調用 UIMerge.Merge() 發送網路合成封包
+        6. 等候伺服端完成後，原生調用 ResetParent 恢復乾淨介面，徹底杜絕畫面卡死
         """
         u = self.locate_uimerge()
         if not u:
@@ -1574,50 +1601,58 @@ class PCFishMemory:
             return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
 
         k = self.read_ptr(u)
+        mi_reset = self.get_class_method(k, "ResetParent")
+        mi_setparent = self.get_class_method(k, "SetParent")
         mi_merge = self.get_class_method(k, "Merge")
-        if not mi_merge:
+
+        # 備援：若動態方法名未取到，由虛擬表固定 offset 回退
+        if not (mi_reset and mi_setparent and mi_merge):
             methods_ptr = self.read_ptr(k + 0x98)
             if methods_ptr:
-                mi_merge = self.read_ptr(methods_ptr + 14 * 8)
-        if not mi_merge:
-            return False, "無法取得 UIMerge.Merge 方法指針"
+                mi_reset = mi_reset or self.read_ptr(methods_ptr + 10 * 8)
+                mi_setparent = mi_setparent or self.read_ptr(methods_ptr + 11 * 8)
+                mi_merge = mi_merge or self.read_ptr(methods_ptr + 14 * 8)
 
-        # 1. 寫入 mergeFishList (u + 0x78, List<string>)
-        merge_fish_list = self.read_ptr(u + 0x78)
-        if merge_fish_list:
-            items_arr = self.read_ptr(merge_fish_list + 0x10)
-            if items_arr:
-                for idx, f in enumerate(fish_list_10):
-                    self.write_ptr(items_arr + 0x20 + idx * 8, f['idPtr'])
-                self.write_i32(merge_fish_list + 0x18, 10)
-                cur_ver = self.read_i32(merge_fish_list + 0x1c)
-                self.write_i32(merge_fish_list + 0x1c, cur_ver + 1)
+        if not (mi_reset and mi_setparent and mi_merge):
+            return False, "無法讀取 UIMerge 原生函式表 (ResetParent/SetParent/Merge)"
 
-        # 2. 寫入 listViewItem (u + 0x40, UI槽位)
-        list_view = self.read_ptr(u + 0x40)
-        if list_view:
-            slots_arr = self.read_ptr(list_view + 0x10) or list_view
-            for idx, f in enumerate(fish_list_10):
-                slot = self.read_ptr(slots_arr + 0x20 + idx * 8)
-                if slot:
-                    self.write_ptr(slot + 0x88, f['ptr'])
+        # 1. 先重置槽位與介面
+        self.invoke_il2cpp_method(mi_reset, u)
 
-        # 3. 設置合成型態 (賽季合成 vs 一般融合)
+        # 2. 設置合成型態 (賽季合成需設置 mergeType 與 targetStar)
         self.write_i32(u + 0xb8, merge_type)
         if merge_type == 1:
             self.write_i32(u + 0xc8, target_star)
-            # fishType (+0xc0) 為 string 指針，從材料魚讀取合法 Type string 指標
-            fish_type_ptr = self.read_ptr(fish_list_10[0]['ptr'] + 0x20)
-            if fish_type_ptr:
-                self.write_ptr(u + 0xc0, fish_type_ptr)
+            gdm = self.locate_gamedata_manager()
+            if gdm:
+                d_ptr = self.read_ptr(gdm + 0x58)
+                if d_ptr:
+                    count = self.read_i32(d_ptr + 0x20)
+                    entries = self.read_ptr(d_ptr + 0x18)
+                    for idx in range(count):
+                        e_addr = entries + 0x20 + idx * 24
+                        k_ptr = self.read_ptr(e_addr + 8)
+                        if self.read_utf16_str(k_ptr) == target_season_type:
+                            val_ptr = self.read_ptr(e_addr + 16)
+                            self.write_ptr(u + 0xc0, val_ptr)
+                            break
         else:
             self.write_ptr(u + 0xc0, 0)
             self.write_i32(u + 0xc8, 0)
 
-        # 4. 原生調用 UIMerge.Merge() 發送核心合成訊號 (乾淨發送、絕無 UI 彈窗)
+        # 3. 依序將 10 隻材料魚透過 SetParent 注入槽位 (原生自動更新槽位、預覽與計數)
+        for f in fish_list_10:
+            self.invoke_il2cpp_method(mi_setparent, u, [f['idPtr']])
+
+        # 4. 調用 Merge 發送核心合成訊號
         ok, msg = self.invoke_il2cpp_method(mi_merge, u)
         if not ok:
             return False, f"合成發送失敗: {msg}"
 
+        # 5. 等候 1.2 秒後重置介面，確保 viewMerge 恢復可見、杜絕畫面卡死
+        time.sleep(1.2)
+        self.invoke_il2cpp_method(mi_reset, u)
+
         type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
-        return True, f"⚡ 純記憶體合成成功: {type_desc} (已成功發送合成訊號並消耗材料)"
+        return True, f"★ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"
+
