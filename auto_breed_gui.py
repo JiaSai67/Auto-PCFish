@@ -35,7 +35,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.0.9 STABLE")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.0 STABLE (混合安全模式)")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -45,6 +45,8 @@ class AutoBreedApp:
         self.is_running = False
         self.is_monitoring = True
         self.is_batch_merging = False
+        self.stop_event = threading.Event()
+        self.autobread_thread = None
         self.cached_fish = []
         self.cached_class_res = {}
 
@@ -968,7 +970,7 @@ class AutoBreedApp:
 
                 self.log(f"【單次鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送繁殖訊號...")
 
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=False, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
@@ -995,6 +997,11 @@ class AutoBreedApp:
     # ==========================================
     def toggle_autobread(self):
         if not self.is_running:
+            if self.autobread_thread and self.autobread_thread.is_alive():
+                self.stop_event.set()
+                self.autobread_thread.join(timeout=0.5)
+
+            self.stop_event.clear()
             self.is_running = True
             self.btn_toggle.configure(
                 text="⏹  停止自動繁殖",
@@ -1003,11 +1010,12 @@ class AutoBreedApp:
                 activebackground="#eba0ac",
                 activeforeground="#181825"
             )
-            self.log("【啟動】全自動智能繁殖流程已開啟！")
+            self.log("【啟動】全自動智能繁殖流程已開啟！(混合安全模式: 100% 記憶體親代注入 + 主線程安全觸發)")
             self.autobread_thread = threading.Thread(target=self.autobread_loop, daemon=True)
             self.autobread_thread.start()
         else:
             self.is_running = False
+            self.stop_event.set()
             self.btn_toggle.configure(
                 text="▶  啟動全自動智能繁殖",
                 bg=self.c_green,
@@ -1018,13 +1026,13 @@ class AutoBreedApp:
             self.log("【停止】全自動智能繁殖流程已安全停止。")
 
     def autobread_loop(self):
-        """全自動智能繁殖後台主循環"""
-        while self.is_running:
+        """全自動智能繁殖後台主循環 (嚴格 Event 生命週期管理，徹底杜絕多執行緒並發洩漏)"""
+        while self.is_running and not self.stop_event.is_set():
             try:
                 attached, msg = self.mem.attach()
                 if not attached:
                     self.log(f"【休眠】{msg}")
-                    time.sleep(3.0)
+                    if self.stop_event.wait(3.0): break
                     continue
 
                 hearts, timer_str, ok, target_ts = self.mem.get_breed_heart_status()
@@ -1035,13 +1043,13 @@ class AutoBreedApp:
                     sleep_sec = max(2.0, target_ts - now + 1.5) if (target_ts and target_ts > now) else 5.0
                     sleep_sec = min(sleep_sec, 60.0)
                     self.log(f"【休眠等待】當前愛心 ({hearts}/5) 低於設定門檻 ({min_hearts}顆)。繁殖條 [{timer_str}]，預計休眠 {sleep_sec:.0f} 秒...")
-                    time.sleep(sleep_sec)
+                    if self.stop_event.wait(sleep_sec): break
                     continue
 
                 uibreed = self.mem.locate_uibreed()
                 if not uibreed:
                     self.log("【等待】遊戲尚未打開「繁殖」面板，請在遊戲中打開繁殖介面...")
-                    time.sleep(2.0)
+                    if self.stop_event.wait(2.0): break
                     continue
 
                 p1, p2, err_msg = self.mem.get_best_breed_pair(
@@ -1053,12 +1061,13 @@ class AutoBreedApp:
 
                 if not p1 or not p2:
                     self.log(f"【等待可用親代】{err_msg}。等待 3 秒重新檢查...")
-                    time.sleep(3.0)
+                    if self.stop_event.wait(3.0): break
                     continue
 
                 self.log(f"【智能鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}] (剩餘次數: {p1['breed']}/{p2['breed']})，發送繁殖訊號...")
 
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
+                # 關鍵修復：預設採用混合安全模式 (use_memory_signal=False)，避開 Unity Graphics device is null 崩潰
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=False, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
@@ -1071,14 +1080,14 @@ class AutoBreedApp:
                     cd_desc = " | ".join(cd_parts) if cd_parts else "冷卻已同步"
                     self.log(f"  -> 剩餘愛心: {new_h}/5 | {cd_desc}")
 
-                    time.sleep(1.8)
+                    if self.stop_event.wait(1.8): break
                 else:
                     self.log(f"✖ {res_msg}，休眠 3 秒後重試...")
-                    time.sleep(3.0)
+                    if self.stop_event.wait(3.0): break
 
             except Exception as e:
                 self.log(f"繁殖循環發生未預期異常: {str(e)}")
-                time.sleep(3.0)
+                if self.stop_event.wait(3.0): break
 
     # ==========================================
     # 合成動作 1：執行選中的賽季魚合成
@@ -1256,6 +1265,7 @@ class AutoBreedApp:
         self.is_monitoring = False
         self.is_running = False
         self.is_batch_merging = False
+        self.stop_event.set()
         self.mem.detach()
         self.root.destroy()
 

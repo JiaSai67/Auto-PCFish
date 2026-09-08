@@ -237,6 +237,17 @@ class PCFishMemory:
         self.uimerge_addr = None
         self._il2cpp_exports = None
 
+    def is_process_alive(self):
+        """檢查遊戲進程是否仍然正常存活 (避免閃退時誤讀記憶體)"""
+        if not self.h_proc or not self.pid:
+            return False
+        exit_code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(self.h_proc, ctypes.byref(exit_code)):
+            STILL_ACTIVE = 259
+            return exit_code.value == STILL_ACTIVE
+        return False
+
+
     def read_bytes(self, addr, size):
         if not self.h_proc or not addr: return b''
         buf = (ctypes.c_char * size)()
@@ -1144,48 +1155,58 @@ class PCFishMemory:
     def wait_for_breed_confirmation(self, p1, p2, old_hearts, timeout=3.5):
         """
         發送繁殖訊號後，精確握手確認伺服端狀態更新：
-        1. 愛心數量減少 (old_hearts -> old_hearts - 1)
-        2. 親代魚之一進入冷卻狀態 (BreedNextDatetime 更新為未來時間)
-        3. 親代魚之一剩餘配種次數減少 (breed 遞減)
+        1. 檢查遊戲進程是否存活 (嚴防閃退 Crash 誤判)
+        2. 愛心數量是否正常減少 (old_hearts -> old_hearts - 1)
+        3. 親代魚之一進入冷卻狀態 (BreedNextDatetime 更新為未來時間)
+        4. 親代魚之一剩餘配種次數減少 (breed 遞減)
         在 timeout 秒內以 80ms 頻率輪詢，一旦確認即刻回傳 True。
         若超時則回傳 False，嚴格防止盲目重複發送訊號！
         """
         start_t = time.time()
         p1_ptr = p1['ptr']
-        p2_ptr = p2['ptr']
+        p2_ptr = p2.get('ptr')
         old_p1_breed = p1['breed']
         old_p2_breed = p2['breed']
 
         while time.time() - start_t < timeout:
             time.sleep(0.08)
+
+            # 關鍵防護 1: 優先確認進程是否意外閃退
+            if not self.is_process_alive():
+                return False, "遊戲進程已意外終止 (Crash)"
+
             now_ts = int(time.time())
 
-            # 檢查 1: 愛心數量是否減少
-            cur_hearts, _, _, _ = self.get_breed_heart_status()
-            if cur_hearts < old_hearts:
+            # 關鍵防護 2: 檢查愛心數量，必須在 ok_h 為 True 情況下比對
+            cur_hearts, _, ok_h, _ = self.get_breed_heart_status()
+            if ok_h and cur_hearts < old_hearts:
                 return True, f"愛心已成功扣除 ({old_hearts} -> {cur_hearts})"
 
-            # 檢查 2: 親代 1 是否已進入冷卻
-            p_dt1 = self.read_ptr(p1_ptr + 0x48)
-            s_dt1 = self.read_utf16_str(p_dt1)
-            ts1 = parse_cooldown_datetime(s_dt1)
-            if ts1 > now_ts:
-                self.fish_cd_registry[p1['id']] = ts1
-                return True, f"親代 1 [{p1['name']}] 已進入冷卻倒數"
+            # 檢查 3: 親代 1 是否已進入冷卻
+            if p1_ptr:
+                p_dt1 = self.read_ptr(p1_ptr + 0x48)
+                if p_dt1:
+                    s_dt1 = self.read_utf16_str(p_dt1)
+                    ts1 = parse_cooldown_datetime(s_dt1)
+                    if ts1 > now_ts:
+                        self.fish_cd_registry[p1['id']] = ts1
+                        return True, f"親代 1 [{p1['name']}] 已進入冷卻倒數"
 
-            # 檢查 3: 親代 2 是否進入冷卻 (非基礎魚時)
-            if not p2.get('is_basic'):
+            # 檢查 4: 親代 2 是否進入冷卻 (非基礎魚時)
+            if not p2.get('is_basic') and p2_ptr:
                 p_dt2 = self.read_ptr(p2_ptr + 0x48)
-                s_dt2 = self.read_utf16_str(p_dt2)
-                ts2 = parse_cooldown_datetime(s_dt2)
-                if ts2 > now_ts:
-                    self.fish_cd_registry[p2['id']] = ts2
-                    return True, f"親代 2 [{p2['name']}] 已進入冷卻倒數"
+                if p_dt2:
+                    s_dt2 = self.read_utf16_str(p_dt2)
+                    ts2 = parse_cooldown_datetime(s_dt2)
+                    if ts2 > now_ts:
+                        self.fish_cd_registry[p2['id']] = ts2
+                        return True, f"親代 2 [{p2['name']}] 已進入冷卻倒數"
 
-            # 檢查 4: 配種次數是否已扣除
-            cur_p1_breed = self.read_i32(p1_ptr + 0x34)
-            if cur_p1_breed < old_p1_breed:
-                return True, f"親代 1 配種次數已扣除 ({old_p1_breed} -> {cur_p1_breed})"
+            # 檢查 5: 配種次數是否已扣除
+            if p1_ptr:
+                cur_p1_breed = self.read_i32(p1_ptr + 0x34)
+                if 0 <= cur_p1_breed < old_p1_breed:
+                    return True, f"親代 1 配種次數已扣除 ({old_p1_breed} -> {cur_p1_breed})"
 
         return False, "等待伺服端冷卻/扣心狀態確認逾時 (3.5秒內未更新)"
 
@@ -1231,7 +1252,12 @@ class PCFishMemory:
         return cd1, ts1, cd2, ts2
 
     def execute_mouse_breed(self, p1, p2):
-        """實體滑鼠點擊降級備用方案"""
+        """
+        混合安全模式 (Hybrid Safe Execution)：
+        1. 親代配對放入：100% 純記憶體直接寫入槽位 (免翻頁、免拖曳、零操作失誤)
+        2. 繁殖點擊觸發：透過主線程視窗分發點擊 (100% 避開 Unity 非渲染線程 Graphics device is null 崩潰)
+        3. 彈窗自動確認：點擊後自動關閉獲得魚結算彈窗，游標極速瞬移復原
+        """
         ok, msg = self.set_breed_parents(p1, p2)
         if not ok:
             return False, msg
@@ -1242,7 +1268,7 @@ class PCFishMemory:
 
         user32.ShowWindow(wnd, 9)
         user32.SetForegroundWindow(wnd)
-        time.sleep(0.12)
+        time.sleep(0.1)
 
         cl_rect = wintypes.RECT()
         user32.GetClientRect(wnd, ctypes.byref(cl_rect))
@@ -1261,32 +1287,49 @@ class PCFishMemory:
         MOUSEEVENTF_LEFTDOWN = 0x0002
         MOUSEEVENTF_LEFTUP = 0x0004
 
+        # 步驟 1: 極速點擊「繁殖」按鈕
         user32.SetCursorPos(btn_x, btn_y)
-        time.sleep(0.06)
+        time.sleep(0.04)
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.06)
+        time.sleep(0.04)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-        time.sleep(1.2)
+        # 步驟 2: 等待獲得魚結算彈窗 (約 1 秒)
+        time.sleep(1.0)
+
+        # 步驟 3: 點擊確認關閉結算彈窗
         res_x = origin.x + int(w * 0.86)
         res_y = origin.y + int(h * 0.65)
         user32.SetCursorPos(res_x, res_y)
-        time.sleep(0.06)
+        time.sleep(0.04)
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.06)
+        time.sleep(0.04)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-        user32.SetCursorPos(cur_pt.x, cur_pt.y)
-        return True, f"🖱️ 滑鼠點擊傳送成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
+        # 步驟 4: 於視窗中央輔助點擊一次，確保關閉任何殘餘遮罩
+        time.sleep(0.15)
+        mid_x = origin.x + int(w * 0.5)
+        mid_y = origin.y + int(h * 0.5)
+        user32.SetCursorPos(mid_x, mid_y)
+        time.sleep(0.03)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.03)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-    def execute_breed(self, p1, p2, use_memory_signal=True, wait_confirm=True):
+        # 步驟 5: 立即復原使用者滑鼠游標
+        user32.SetCursorPos(cur_pt.x, cur_pt.y)
+        return True, f"🖱️ 混合安全觸發成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
+
+    def execute_breed(self, p1, p2, use_memory_signal=False, wait_confirm=True):
         """
         執行自動繁殖操作：
         1. 記錄執行前愛心狀態
-        2. 原生訊號直發 (不移滑鼠、不搶焦點)
+        2. 預設採用「記憶體親代注入 + 主線程安全觸發」混合模式 (完全避開 Unity 背景線程 Graphics device is null 崩潰)
         3. 等待伺服端冷卻與扣心握手確認 (避免重複發送)
         """
-        old_hearts, _, _, _ = self.get_breed_heart_status()
+        old_hearts, _, ok_h, _ = self.get_breed_heart_status()
+        if not ok_h:
+            old_hearts = 5
 
         if use_memory_signal:
             ok, msg = self.execute_pure_signal_breed(p1, p2)
@@ -1304,6 +1347,7 @@ class PCFishMemory:
             return True, f"{msg} | 伺服端已確認 ({c_msg})"
 
         return True, msg
+
 
     def locate_uimerge(self):
         """驗證快取或全動態掃描 UIMerge 實例 (0.01ms 快取 / 0.5s 首次掃描)"""
