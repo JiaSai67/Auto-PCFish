@@ -101,6 +101,64 @@ def get_fish_display_name(fish_code, id_str=""):
     prefix = fish_code.split('_')[0].upper()
     return FISH_NAMES.get(prefix, prefix)
 
+# ==========================================
+# 官方賽季魚配方規則庫 (Season Craft Recipes)
+# 規則：
+# 1星: 3種同級素材各3隻 (9隻) + 1隻上級素材 (1隻) = 10隻
+# 2~5星: 前一星級賽季魚 (1隻) + 原本3種同級素材各3隻 (隨星數成長同星級) = 10隻
+# ==========================================
+SEASON_RECIPES = {
+    # 霜藍翻車魚 (FS00033, 稀有): 1星需 上級 FS00014*1 + 同級 FS00007*3 + FS00008*3 + FS00009*3
+    ("FS00033", 1): [
+        {"type": "FS00014", "star": 1, "amount": 1},
+        {"type": "FS00007", "star": 1, "amount": 3},
+        {"type": "FS00008", "star": 1, "amount": 3},
+        {"type": "FS00009", "star": 1, "amount": 3},
+    ],
+    # 萊姆背海龜 (FS00034, 傳奇): 1星需 上級 FS00021*1 + 同級 FS00016*3 + FS00017*3 + FS00018*3
+    ("FS00034", 1): [
+        {"type": "FS00021", "star": 1, "amount": 1},
+        {"type": "FS00016", "star": 1, "amount": 3},
+        {"type": "FS00017", "star": 1, "amount": 3},
+        {"type": "FS00018", "star": 1, "amount": 3},
+    ],
+    # 祭典章魚 (FS00035, 神話): 1星需 上級 FS00027*1 + 同級 FS00020*3 + FS00022*3 + FS00023*3
+    ("FS00035", 1): [
+        {"type": "FS00027", "star": 1, "amount": 1},
+        {"type": "FS00020", "star": 1, "amount": 3},
+        {"type": "FS00022", "star": 1, "amount": 3},
+        {"type": "FS00023", "star": 1, "amount": 3},
+    ]
+}
+
+# 動態產生 2~5 星官方配方
+for star in range(2, 6):
+    prev_star = star - 1
+    SEASON_RECIPES[("FS00033", star)] = [
+        {"type": "FS00033", "star": prev_star, "amount": 1},
+        {"type": "FS00007", "star": star, "amount": 3},
+        {"type": "FS00008", "star": star, "amount": 3},
+        {"type": "FS00009", "star": star, "amount": 3},
+    ]
+    SEASON_RECIPES[("FS00034", star)] = [
+        {"type": "FS00034", "star": prev_star, "amount": 1},
+        {"type": "FS00016", "star": star, "amount": 3},
+        {"type": "FS00017", "star": star, "amount": 3},
+        {"type": "FS00018", "star": star, "amount": 3},
+    ]
+    SEASON_RECIPES[("FS00035", star)] = [
+        {"type": "FS00035", "star": prev_star, "amount": 1},
+        {"type": "FS00020", "star": star, "amount": 3},
+        {"type": "FS00022", "star": star, "amount": 3},
+        {"type": "FS00023", "star": star, "amount": 3},
+    ]
+
+SEASON_TARGETS = [
+    ("FS00035", "祭典章魚", "神話"),
+    ("FS00034", "萊姆背海龜", "傳奇"),
+    ("FS00033", "霜藍翻車魚", "稀有"),
+]
+
 class PCFishMemory:
     def __init__(self):
         self.pid = None
@@ -111,6 +169,8 @@ class PCFishMemory:
         self.fish_model_klass = None
         self.uibreed_klass = None
         self.uibreed_addr = None
+        self.uimerge_klass = None
+        self.uimerge_addr = None
         self.game_wnd = None
         self.fish_cd_registry = {} # 本地魚隻冷卻時間戳登記字典 {fish_id: target_timestamp}
         self._il2cpp_exports = None
@@ -341,6 +401,7 @@ class PCFishMemory:
             'GameDataManager': ('NN.PF.Core.Managers', 'gamedata_klass'),
             'FishModel': ('NN.PF.Models', 'fish_model_klass'),
             'UIBreed': ('NN.PF.UI.Breed', 'uibreed_klass'),
+            'UIMerge': ('NN.PF.UI.Merge', 'uimerge_klass'),
         }
 
         for cname, (ns, attr_name) in targets.items():
@@ -575,7 +636,7 @@ class PCFishMemory:
                         is_cooldown = (cd_target > now_ts)
                         cd_remain = max(0, cd_target - now_ts) if is_cooldown else 0
 
-                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and can_breed and (0 <= grade <= 10):
+                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= grade <= 10):
                             disp_name = get_fish_display_name(fish_code, id_str)
                             rarity_name = RARITY_MAP.get(grade, f"等級{grade}")
                             stars_icon = "✦" * max(1, level) if not is_basic else "-"
@@ -587,8 +648,10 @@ class PCFishMemory:
                                 "fish": fish_code,
                                 "name": disp_name,
                                 "rarity": rarity_name,
+                                "rarity_val": grade,
                                 "grade": grade,
                                 "level": level,
+                                "star": level,
                                 "stars": stars_icon,
                                 "growth": growth,
                                 "breed": breed,
@@ -655,7 +718,7 @@ class PCFishMemory:
                         is_cooldown = (next_ts > now_ts)
                         cd_remain = max(0, next_ts - now_ts) if is_cooldown else 0
 
-                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and can_breed and (0 <= grade <= 10):
+                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= grade <= 10):
                             disp_name = get_fish_display_name(fish_code, id_str)
                             rarity_name = RARITY_MAP.get(grade, f"等級{grade}")
                             stars_icon = "✦" * max(1, level) if not is_basic else "-"
@@ -667,8 +730,10 @@ class PCFishMemory:
                                 "fish": fish_code,
                                 "name": disp_name,
                                 "rarity": rarity_name,
+                                "rarity_val": grade,
                                 "grade": grade,
                                 "level": level,
+                                "star": level,
                                 "stars": stars_icon,
                                 "growth": growth,
                                 "breed": breed,
@@ -1228,3 +1293,285 @@ class PCFishMemory:
             return True, f"{msg} | 伺服端已確認 ({c_msg})"
 
         return True, msg
+
+    def locate_uimerge(self):
+        """驗證快取或全動態掃描 UIMerge 實例 (0.01ms 快取 / 0.5s 首次掃描)"""
+        if self.uimerge_addr and self.uimerge_klass:
+            k = self.read_ptr(self.uimerge_addr)
+            if k == self.uimerge_klass:
+                slots = self.read_ptr(self.uimerge_addr + 0x40)
+                pids = self.read_ptr(self.uimerge_addr + 0x78)
+                if slots and pids and self.read_i32(slots + 0x18) == 10 and self.read_i32(pids + 0x18) == 10:
+                    return self.uimerge_addr
+
+        if not self.uimerge_klass:
+            self.resolve_il2cpp_classes()
+            if not self.uimerge_klass:
+                return None
+
+        target = struct.pack('<Q', self.uimerge_klass)
+        addr = 0
+        mbi = MBI()
+        while kernel32.VirtualQueryEx(self.h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize
+            if mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
+                chunk_size = 65536
+                for offset in range(0, size, chunk_size):
+                    to_read = min(chunk_size + 8, size - offset)
+                    b = self.read_bytes(base + offset, to_read)
+                    pos = 0
+                    while True:
+                        p = b.find(target, pos)
+                        if p == -1: break
+                        cand = base + offset + p
+                        slots = self.read_ptr(cand + 0x40)
+                        pids = self.read_ptr(cand + 0x78)
+                        craft = self.read_ptr(cand + 0x80)
+                        if slots and pids and craft and 0x10000 <= slots <= 0x7FFFFFFFFFFF and 0x10000 <= pids <= 0x7FFFFFFFFFFF:
+                            if self.read_i32(slots + 0x18) == 10 and self.read_i32(pids + 0x18) == 10:
+                                self.uimerge_addr = cand
+                                return cand
+                        pos = p + 8
+            addr = base + size
+            if addr >= 0x7FFFFFFFFFFF: break
+        return None
+
+    def get_season_and_general_classification(self, all_fish=None, max_merge_rarity=2):
+        """
+        賽季與一般魚快速分類核心引擎：
+        1. 針對官方 3 大賽季魚（霜藍翻車魚、萊姆背海龜、祭典章魚）1~5 星精確盤點材料庫存狀況。
+        2. 依據稀有度（神話 FS00035 > 傳奇 FS00034 > 稀有 FS00033）由高至低依序鎖定材料，高星級/低星級全層級預留保護。
+        3. 只要吻合賽季配方需求的魚隻（含已齊全或正在籌備中的數量），全部加入 reserved_fish_ids，禁止挪作一般融合！
+        4. 將非賽季魚種（FS00001~FS00006 等）與賽季多餘溢出的魚隻獨立分流為一般魚融合池 (general_pool)。
+        5. 安全防誤融：一般魚融合池預設僅取普通 (1) 與高級 (2) 魚隻，嚴禁放入神話 (5) 與傳說 (4)！
+        6. 一般魚融合池按「剩餘繁殖次數少者優先（0次廢魚優先融合）」與「同星級同稀有度」排序分組。
+        """
+        if all_fish is None:
+            all_fish = self.get_all_fish()
+
+        # 1. 建立可用庫存字典: {(fish_type, star): [fish, ...]}
+        inv_pool = {}
+        for f in all_fish:
+            parts = f['fish'].split('_')
+            f_type = parts[0]
+            star = int(parts[2]) if len(parts) >= 3 else 1
+            f['star'] = star
+            f['type'] = f_type
+            inv_pool.setdefault((f_type, star), []).append(f)
+
+        reserved_fish_ids = set()
+        allocated_ids = set()
+        season_status_list = []
+        ready_craft_list = []
+
+        # 2. 依神話 > 傳奇 > 稀有 依序預留材料
+        priority_season_targets = [
+            ("FS00035", "祭典章魚", "神話"),
+            ("FS00034", "萊姆背海龜", "傳奇"),
+            ("FS00033", "霜藍翻車魚", "稀有"),
+        ]
+
+        for s_type, s_name, s_rarity in priority_season_targets:
+            for star in range(1, 6):
+                key = (s_type, star)
+                if key not in SEASON_RECIPES: continue
+                reqs = SEASON_RECIPES[key]
+
+                total_req = 10
+                matched_count = 0
+                missing_details = []
+                selected_for_recipe = []
+
+                for req in reqs:
+                    m_type = req['type']
+                    m_star = req['star']
+                    m_amt = req['amount']
+                    m_name = FISH_NAMES.get(m_type, m_type)
+
+                    avail = [f for f in inv_pool.get((m_type, m_star), []) if f['id'] not in allocated_ids and not f['is_locked']]
+                    taken = avail[:m_amt]
+                    matched_count += len(taken)
+                    selected_for_recipe.extend(taken)
+
+                    if len(taken) < m_amt:
+                        missing_details.append(f"{m_name}({m_star}星) 缺 {m_amt - len(taken)} 隻")
+
+                is_ready = (matched_count == total_req)
+                if is_ready:
+                    for f in selected_for_recipe:
+                        allocated_ids.add(f['id'])
+                        reserved_fish_ids.add(f['id'])
+                    ready_craft_list.append({
+                        "target_type": s_type,
+                        "target_name": s_name,
+                        "target_rarity": s_rarity,
+                        "target_star": star,
+                        "materials": selected_for_recipe
+                    })
+                else:
+                    # 部分符合也預留保護，防止被挪作一般融合
+                    for f in selected_for_recipe:
+                        reserved_fish_ids.add(f['id'])
+
+                season_status_list.append({
+                    "target_type": s_type,
+                    "target_name": s_name,
+                    "target_rarity": s_rarity,
+                    "target_star": star,
+                    "progress": f"{matched_count}/10",
+                    "progress_val": matched_count,
+                    "is_ready": is_ready,
+                    "missing": missing_details,
+                    "selected": selected_for_recipe
+                })
+
+        # 3. 分流：非賽季魚所需的魚種 + 賽季多餘溢出的魚種 -> 一般魚合成池
+        # 排除已鎖定與基礎魚，且嚴格限制稀有度 (預設上限為高級 2，禁止傳說與神話誤融)
+        general_candidates = [
+            f for f in all_fish 
+            if f['id'] not in reserved_fish_ids 
+            and not f['is_locked'] 
+            and not f.get('is_basic', False)
+            and f.get('rarity_val', 1) <= max_merge_rarity
+        ]
+
+        # 排序：
+        # 1. 剩餘繁殖次數由低到高 (0次廢魚優先融合，耗損多餘魚隻)
+        # 2. 星級由低到高
+        # 3. 稀有度
+        general_candidates.sort(key=lambda f: (f['breed'], f.get('star', 1), f.get('rarity_val', 0)))
+
+        # 10 隻為一組打包
+        general_batches = []
+        for i in range(0, len(general_candidates) - (len(general_candidates) % 10), 10):
+            batch = general_candidates[i:i+10]
+            general_batches.append(batch)
+
+        return {
+            "total_fish": len(all_fish),
+            "reserved_count": len(reserved_fish_ids),
+            "season_status": season_status_list,
+            "ready_crafts": ready_craft_list,
+            "general_pool": general_candidates,
+            "general_pool_count": len(general_candidates),
+            "general_batches": general_batches
+        }
+
+    def set_merge_parents(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
+        """將 10 隻魚寫入 UIMerge 槽位與 parentFishIds"""
+        uimerge = self.locate_uimerge()
+        if not uimerge:
+            return False, "無法在遊戲記憶體中定位 UIMerge 實例"
+
+        if len(fish_list_10) != 10:
+            return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
+
+        pids = self.read_ptr(uimerge + 0x78)
+        slots = self.read_ptr(uimerge + 0x40)
+        if not pids or not slots:
+            return False, "UIMerge 槽位陣列無效"
+
+        for i, f in enumerate(fish_list_10):
+            self.write_ptr(pids + 0x20 + i * 8, f['idPtr'])
+            slot_item = self.read_ptr(slots + 0x20 + i * 8)
+            if slot_item:
+                self.write_ptr(slot_item + 0x88, f['ptr'])
+
+        self.write_i32(uimerge + 0xb8, merge_type)
+        if merge_type == 1:
+            self.write_i32(uimerge + 0xc8, target_star)
+            gdm = self.locate_gamedata_manager()
+            if gdm:
+                d_ptr = self.read_ptr(gdm + 0x58)
+                if d_ptr:
+                    count = self.read_i32(d_ptr + 0x20)
+                    entries = self.read_ptr(d_ptr + 0x18)
+                    for idx in range(count):
+                        e_addr = entries + 0x20 + idx * 24
+                        k_ptr = self.read_ptr(e_addr + 8)
+                        if self.read_utf16_str(k_ptr) == target_season_type:
+                            val_ptr = self.read_ptr(e_addr + 16)
+                            self.write_ptr(uimerge + 0xc0, val_ptr)
+                            break
+        else:
+            self.write_ptr(uimerge + 0xc0, 0)
+
+        return True, "10 隻魚已就位"
+
+    def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
+        """
+        純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
+        1. 驗證並將 10 隻魚精準注入 UIMerge 槽位中
+        2. 動態解析 UIMerge.Merge 的 MethodInfo 指針
+        3. 透過 il2cpp_thread_attach 註冊託管線程
+        4. 透過 il2cpp_runtime_invoke 原生調用 UIMerge.Merge，直發核心合成訊號
+        5. 100% 後台靜默運行、不碰實體滑鼠、不搶焦點
+        """
+        ok, msg = self.set_merge_parents(fish_list_10, merge_type, target_season_type, target_star)
+        if not ok:
+            return False, msg
+
+        u = self.locate_uimerge()
+        if not u:
+            return False, "無法定位遊戲 UIMerge 實例"
+
+        k = self.read_ptr(u)
+        methods_ptr = self.read_ptr(k + 0x98)
+        if not methods_ptr:
+            return False, "無法讀取 UIMerge 函式表"
+
+        # Method[14]: Merge (核心合成/融合事件)
+        mi_merge = self.read_ptr(methods_ptr + 14 * 8)
+        if not mi_merge:
+            return False, "未找到 Merge 核心指針"
+
+        exports = self.get_il2cpp_exports()
+        if not exports or 'il2cpp_domain_get' not in exports:
+            return False, "無法解析 IL2CPP 核心導出函式"
+
+        fn_domain_get = exports['il2cpp_domain_get']
+        fn_thread_attach = exports['il2cpp_thread_attach']
+        fn_runtime_invoke = exports['il2cpp_runtime_invoke']
+
+        shellcode = bytearray()
+        shellcode.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
+
+        # 1. domain = il2cpp_domain_get()
+        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_domain_get))
+        shellcode.extend(b'\xFF\xD0')
+
+        # 2. thread = il2cpp_thread_attach(domain)
+        shellcode.extend(b'\x48\x89\xC1')
+        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_thread_attach))
+        shellcode.extend(b'\xFF\xD0')
+
+        # 3. il2cpp_runtime_invoke(mi_merge, u, NULL, NULL)
+        shellcode.extend(b'\x48\xB9' + struct.pack('<Q', mi_merge))
+        shellcode.extend(b'\x48\xBA' + struct.pack('<Q', u))
+        shellcode.extend(b'\x4D\x31\xC0') # params = NULL
+        shellcode.extend(b'\x4D\x31\xC9') # exc = NULL
+        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke))
+        shellcode.extend(b'\xFF\xD0')
+
+        shellcode.extend(b'\x48\x83\xC4\x28') # add rsp, 0x28
+        shellcode.extend(b'\xC3') # ret
+
+        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(shellcode), 0x1000 | 0x2000, 0x40)
+        if not code_addr:
+            return False, "分配遠程代碼空間失敗"
+
+        written = ctypes.c_size_t()
+        kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(shellcode), len(shellcode), ctypes.byref(written))
+
+        h_thread = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_addr), None, 0, None)
+        if not h_thread:
+            kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+            return False, "建立遠程記憶體執行緒失敗"
+
+        kernel32.WaitForSingleObject(h_thread, 5000)
+        kernel32.CloseHandle(h_thread)
+        kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+
+        type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
+        return True, f"⚡ 純記憶體訊號發送成功: {type_desc} (10 隻材料魚)"

@@ -27,7 +27,7 @@ def register():
     tools.append({
         "name": "PC Fish 智能繁殖管理終端",
         "repo_name": "Auto-PCFish",
-        "description": "PC Fish 全自動記憶體直讀繁殖、最高期望值黃金階梯配種、無感差量更新與本地計時休眠工具",
+        "description": "PC Fish 全自動記憶體直讀繁殖、官方最高期望值階梯配種、賽季魚合成雷達與一般魚純記憶體融合工具",
         "executable": exec_path,
         "working_dir": cwd
     })
