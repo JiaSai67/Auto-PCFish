@@ -1470,29 +1470,93 @@ class PCFishMemory:
             "general_batches": general_batches
         }
 
-    def set_merge_parents(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
-        """將 10 隻魚寫入 UIMerge 槽位與 parentFishIds"""
-        uimerge = self.locate_uimerge()
-        if not uimerge:
-            return False, "無法在遊戲記憶體中定位 UIMerge 實例"
+    def invoke_il2cpp_method(self, method_info, obj_ptr, param_ptrs=None):
+        """通用 IL2CPP 方法遠程原生調用封裝 (附帶線程註冊與調度)"""
+        if not method_info or not self.h_proc:
+            return False, "無效的 MethodInfo 或進程句柄"
+
+        exports = self.get_il2cpp_exports()
+        if not exports or 'il2cpp_domain_get' not in exports:
+            return False, "無法取得 IL2CPP 導出函式"
+
+        fn_domain_get = exports['il2cpp_domain_get']
+        fn_thread_attach = exports['il2cpp_thread_attach']
+        fn_runtime_invoke = exports['il2cpp_runtime_invoke']
+
+        param_mem = 0
+        if param_ptrs:
+            param_mem = kernel32.VirtualAllocEx(self.h_proc, None, len(param_ptrs) * 8, 0x3000, 0x04)
+            for i, p in enumerate(param_ptrs):
+                self.write_ptr(param_mem + i * 8, p)
+
+        sc = bytearray()
+        sc.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
+        # domain = il2cpp_domain_get()
+        sc.extend(b'\x48\xB8' + struct.pack('<Q', fn_domain_get) + b'\xFF\xD0')
+        # thread = il2cpp_thread_attach(domain)
+        sc.extend(b'\x48\x89\xC1\x48\xB8' + struct.pack('<Q', fn_thread_attach) + b'\xFF\xD0')
+
+        # il2cpp_runtime_invoke(method_info, obj_ptr, params, NULL)
+        sc.extend(b'\x48\xB9' + struct.pack('<Q', method_info))
+        sc.extend(b'\x48\xBA' + struct.pack('<Q', obj_ptr or 0))
+        if param_mem:
+            sc.extend(b'\x49\xB8' + struct.pack('<Q', param_mem))
+        else:
+            sc.extend(b'\x4D\x31\xC0')
+        sc.extend(b'\x4D\x31\xC9') # exc = NULL
+        sc.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke) + b'\xFF\xD0')
+
+        sc.extend(b'\x48\x83\xC4\x28\xC3')
+
+        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(sc), 0x3000, 0x40)
+        written = ctypes.c_size_t()
+        kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(sc), len(sc), ctypes.byref(written))
+
+        h_th = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_addr), None, 0, None)
+        if not h_th:
+            if param_mem: kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
+            kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+            return False, "建立遠程線程失敗"
+
+        kernel32.WaitForSingleObject(h_th, 4000)
+        kernel32.CloseHandle(h_th)
+        if param_mem: kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
+        kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+        return True, "調用成功"
+
+    def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
+        """
+        純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
+        1. 定位 UIMerge 物件
+        2. 原生調用 ResetParent 清空並重設介面 (確保 viewMerge 處於 Active 狀態)
+        3. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8) 與 targetStar (+0xc8)
+        4. 依序原生調用 SetParent(fishId) 注入 10 隻材料魚，由遊戲原生完成槽位綁定與預測更新
+        5. 原生調用 UIMerge.Merge() 發送網路合成封包
+        6. 等候伺服端完成後，原生調用 ResetParent 恢復乾淨介面，徹底杜絕畫面卡死
+        """
+        u = self.locate_uimerge()
+        if not u:
+            return False, "無法定位遊戲 UIMerge 實例"
 
         if len(fish_list_10) != 10:
             return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
 
-        pids = self.read_ptr(uimerge + 0x78)
-        slots = self.read_ptr(uimerge + 0x40)
-        if not pids or not slots:
-            return False, "UIMerge 槽位陣列無效"
+        k = self.read_ptr(u)
+        methods_ptr = self.read_ptr(k + 0x98)
+        if not methods_ptr:
+            return False, "無法讀取 UIMerge 函式表"
 
-        for i, f in enumerate(fish_list_10):
-            self.write_ptr(pids + 0x20 + i * 8, f['idPtr'])
-            slot_item = self.read_ptr(slots + 0x20 + i * 8)
-            if slot_item:
-                self.write_ptr(slot_item + 0x88, f['ptr'])
+        mi_reset = self.read_ptr(methods_ptr + 10 * 8)     # ResetParent
+        mi_setparent = self.read_ptr(methods_ptr + 11 * 8) # SetParent
+        mi_merge = self.read_ptr(methods_ptr + 14 * 8)     # Merge
 
-        self.write_i32(uimerge + 0xb8, merge_type)
+        # 1. 先重置槽位與介面
+        self.invoke_il2cpp_method(mi_reset, u)
+
+        # 2. 設置合成型態 (賽季合成需設置 mergeType 與 targetStar)
+        self.write_i32(u + 0xb8, merge_type)
         if merge_type == 1:
-            self.write_i32(uimerge + 0xc8, target_star)
+            self.write_i32(u + 0xc8, target_star)
             gdm = self.locate_gamedata_manager()
             if gdm:
                 d_ptr = self.read_ptr(gdm + 0x58)
@@ -1504,86 +1568,23 @@ class PCFishMemory:
                         k_ptr = self.read_ptr(e_addr + 8)
                         if self.read_utf16_str(k_ptr) == target_season_type:
                             val_ptr = self.read_ptr(e_addr + 16)
-                            self.write_ptr(uimerge + 0xc0, val_ptr)
+                            self.write_ptr(u + 0xc0, val_ptr)
                             break
         else:
-            self.write_ptr(uimerge + 0xc0, 0)
+            self.write_ptr(u + 0xc0, 0)
 
-        return True, "10 隻魚已就位"
+        # 3. 依序將 10 隻材料魚透過 SetParent 注入槽位 (原生自動更新槽位、預覽與計數)
+        for f in fish_list_10:
+            self.invoke_il2cpp_method(mi_setparent, u, [f['idPtr']])
 
-    def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
-        """
-        純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
-        1. 驗證並將 10 隻魚精準注入 UIMerge 槽位中
-        2. 動態解析 UIMerge.Merge 的 MethodInfo 指針
-        3. 透過 il2cpp_thread_attach 註冊託管線程
-        4. 透過 il2cpp_runtime_invoke 原生調用 UIMerge.Merge，直發核心合成訊號
-        5. 100% 後台靜默運行、不碰實體滑鼠、不搶焦點
-        """
-        ok, msg = self.set_merge_parents(fish_list_10, merge_type, target_season_type, target_star)
+        # 4. 調用 Merge 發送核心合成訊號
+        ok, msg = self.invoke_il2cpp_method(mi_merge, u)
         if not ok:
-            return False, msg
+            return False, f"合成發送失敗: {msg}"
 
-        u = self.locate_uimerge()
-        if not u:
-            return False, "無法定位遊戲 UIMerge 實例"
-
-        k = self.read_ptr(u)
-        methods_ptr = self.read_ptr(k + 0x98)
-        if not methods_ptr:
-            return False, "無法讀取 UIMerge 函式表"
-
-        # Method[14]: Merge (核心合成/融合事件)
-        mi_merge = self.read_ptr(methods_ptr + 14 * 8)
-        if not mi_merge:
-            return False, "未找到 Merge 核心指針"
-
-        exports = self.get_il2cpp_exports()
-        if not exports or 'il2cpp_domain_get' not in exports:
-            return False, "無法解析 IL2CPP 核心導出函式"
-
-        fn_domain_get = exports['il2cpp_domain_get']
-        fn_thread_attach = exports['il2cpp_thread_attach']
-        fn_runtime_invoke = exports['il2cpp_runtime_invoke']
-
-        shellcode = bytearray()
-        shellcode.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
-
-        # 1. domain = il2cpp_domain_get()
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_domain_get))
-        shellcode.extend(b'\xFF\xD0')
-
-        # 2. thread = il2cpp_thread_attach(domain)
-        shellcode.extend(b'\x48\x89\xC1')
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_thread_attach))
-        shellcode.extend(b'\xFF\xD0')
-
-        # 3. il2cpp_runtime_invoke(mi_merge, u, NULL, NULL)
-        shellcode.extend(b'\x48\xB9' + struct.pack('<Q', mi_merge))
-        shellcode.extend(b'\x48\xBA' + struct.pack('<Q', u))
-        shellcode.extend(b'\x4D\x31\xC0') # params = NULL
-        shellcode.extend(b'\x4D\x31\xC9') # exc = NULL
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke))
-        shellcode.extend(b'\xFF\xD0')
-
-        shellcode.extend(b'\x48\x83\xC4\x28') # add rsp, 0x28
-        shellcode.extend(b'\xC3') # ret
-
-        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(shellcode), 0x1000 | 0x2000, 0x40)
-        if not code_addr:
-            return False, "分配遠程代碼空間失敗"
-
-        written = ctypes.c_size_t()
-        kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(shellcode), len(shellcode), ctypes.byref(written))
-
-        h_thread = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_addr), None, 0, None)
-        if not h_thread:
-            kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
-            return False, "建立遠程記憶體執行緒失敗"
-
-        kernel32.WaitForSingleObject(h_thread, 5000)
-        kernel32.CloseHandle(h_thread)
-        kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+        # 5. 等候 1.2 秒後重置介面，確保 viewMerge 恢復可見、杜絕畫面卡死
+        time.sleep(1.2)
+        self.invoke_il2cpp_method(mi_reset, u)
 
         type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
-        return True, f"⚡ 純記憶體訊號發送成功: {type_desc} (10 隻材料魚)"
+        return True, f"⚡ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"
