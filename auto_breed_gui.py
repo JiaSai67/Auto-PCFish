@@ -156,7 +156,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="PRO v1.0.5",
+            text="PRO v1.0.6",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
