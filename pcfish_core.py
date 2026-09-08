@@ -703,7 +703,8 @@ class PCFishMemory:
              依據官方 100% 原始機率表執行黃金階梯：4x4 > 4x3 > 3x3 > 2x2 > 1x1 > 1x0 > 0x0
              嚴格禁止 3+2（神話率 0%）與 2+1（傳奇率 0%）降階污染！
         3. 搜尋策略：
-           - 優先消化雙傳奇 (4x4)；孤兒傳奇則由稀有魚 (4x3) 催化；其餘層級嚴格同階融合提純。
+           - 第一優先級：嚴格遵循稀有度黃金階梯 (4x4 > 4x3 > 3x3 > 2x2 > 1x1 > 1x0 > 0x0)
+           - 第二優先級：在同稀有度候選池內，剩餘次數較低者優先配種，加速消耗即將用盡的魚隻次數！
         回傳: (p1, p2, status_msg)
         """
         if excluded_names is None:
@@ -742,6 +743,11 @@ class PCFishMemory:
         for f in available:
             g = f['grade']
             by_grade.setdefault(g, []).append(f)
+
+        # 核心優化：同稀有度組內，剩餘次數較低者優先配種 (breed 升序)，優先消耗快耗盡的魚隻
+        for g in by_grade:
+            if g > 0:
+                by_grade[g].sort(key=lambda x: (x['breed'], -x['level']))
 
         # 模式 1：只允許同稀有度繁殖 (嚴格禁止任何跨階)
         if same_rarity_only:

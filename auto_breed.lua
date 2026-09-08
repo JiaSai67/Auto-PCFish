@@ -115,6 +115,17 @@ function GetTopTwoAvailableFish()
         end
     end
 
+    -- 同稀有度組內，剩餘配種次數較少者優先配種 (remainCount 升序)
+    for i = 1, 5 do
+        table.sort(byGrade[i], function(a, b)
+            if a.remainCount ~= b.remainCount then
+                return a.remainCount < b.remainCount
+            end
+            return a.level > b.level
+        end)
+    end
+
+
     -- 最高期望值配對階梯：
     -- 1. 雙傳奇 (4x4) -> Total 8 (神話 5.0%, 傳奇 51.3%, 稀有 43.7%)
     if #byGrade[4] >= 2 then return byGrade[4][1], byGrade[4][2], #eligible end
