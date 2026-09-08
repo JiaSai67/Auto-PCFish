@@ -1,11 +1,11 @@
 """
-PC Fish 智能繁殖與合成管理終端 v1.0.8 STABLE
+PC Fish 智能繁殖與合成管理終端 v1.0.9 STABLE
 - 依照 Impeccable (Operate Mode) 與 AI Tool Standard 規範全新重構
 - 100% 記憶體直讀 GameDataManager (愛心數量、倒數計時、魚隻列表)
 - 魚種冷卻時間全面導入本地 Windows 時間戳登記與平滑倒數
 - 持續背景掃描 + 表格差量就地更新 (In-Place Delta Update)，徹底消除介面刷新閃爍
 - 魚單即時清單過濾次數已盡魚隻，僅展示尚有配種次數之有效魚隻與無限基礎魚
-- 純記憶體 IL2CPP 線程原生直發繁殖訊號 (不移滑鼠、不搶焦點、支援最小化)
+- 純記憶體 IL2CPP 線程原生直發繁殖訊號 (動態解析 Breed 方法，杜絕寫死索引閃退)
 - 具備伺服端狀態握手比對 (愛心扣除/冷卻啟動/次數扣減)，嚴格杜絕重複發送
 - 嚴格導入官方數值底層最高期望值黃金階梯配對 (杜絕 3+2、2+1 降階污染)
 - 🌟 全新支援官方賽季魚 (FS00033 霜藍翻車魚、FS00034 萊姆背海龜、FS00035 祭典章魚) 1~5 星合成雷達
@@ -35,7 +35,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.0.8 STABLE")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.0.9 STABLE")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -679,8 +679,17 @@ class AutoBreedApp:
 
     def log(self, message):
         now = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{now}] {message}\n")
-        self.log_text.see("end")
+        text = f"[{now}] {message}\n"
+        def _append():
+            try:
+                self.log_text.insert("end", text)
+                self.log_text.see("end")
+            except:
+                pass
+        try:
+            self.root.after(0, _append)
+        except:
+            pass
 
     def clear_log(self):
         self.log_text.delete("1.0", "end")

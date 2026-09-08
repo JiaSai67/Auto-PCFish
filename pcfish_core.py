@@ -1110,10 +1110,9 @@ class PCFishMemory:
         """
         純記憶體原生訊號觸發繁殖 (In-Memory Direct Signal Execution)：
         1. 驗證並將挑選的親代精準注入 UIBreed 記憶體槽位中
-        2. 動態解析 UIBreed.Breed 的 MethodInfo 指針
-        3. 透過 il2cpp_thread_attach 註冊 IL2CPP 託管線程
-        4. 透過 il2cpp_runtime_invoke 原生調用一次 UIBreed.Breed，精準發送核心繁殖訊號
-        5. 100% 後台靜默運行、不碰實體滑鼠、不搶焦點、支援視窗最小化
+        2. 動態透過方法名稱精準解析 UIBreed.Breed 的 MethodInfo 指針 (杜絕寫死索引造成閃退)
+        3. 透過統一的 invoke_il2cpp_method 原生調用 UIBreed.Breed，精準發送核心繁殖訊號
+        4. 100% 後台靜默運行、不碰實體滑鼠、不搶焦點、支援視窗最小化
         """
         # 1. 填入親代槽位
         ok, msg = self.set_breed_parents(p1, p2)
@@ -1125,62 +1124,20 @@ class PCFishMemory:
             return False, "遊戲中尚未打開「繁殖」面板，請在遊戲中打開繁殖介面！"
 
         k = self.read_ptr(u)
-        methods_ptr = self.read_ptr(k + 0x98)
-        if not methods_ptr:
-            return False, "無法讀取 UIBreed 函式表"
-
-        # Method[9]: Breed (核心按鈕繁殖事件)
-        mi_breed = self.read_ptr(methods_ptr + 9 * 8)
+        # 動態精準解析 MethodInfo* 指針 (零索引誤差，徹底杜絕固定索引偏位引起的遊戲閃退)
+        mi_breed = self.get_class_method(k, "Breed")
         if not mi_breed:
-            return False, "未找到 Breed 核心指針"
+            methods_ptr = self.read_ptr(k + 0x98)
+            if methods_ptr:
+                mi_breed = self.read_ptr(methods_ptr + 9 * 8)
 
-        exports = self.get_il2cpp_exports()
-        if not exports or 'il2cpp_domain_get' not in exports:
-            return False, "無法解析 IL2CPP 核心導出函式"
+        if not mi_breed:
+            return False, "未找到 Breed 核心原生方法指針"
 
-        fn_domain_get = exports['il2cpp_domain_get']
-        fn_thread_attach = exports['il2cpp_thread_attach']
-        fn_runtime_invoke = exports['il2cpp_runtime_invoke']
-
-        # 組裝 x64 遠程執行機器碼 (註冊 IL2CPP 線程 -> 單次調用 UIBreed.Breed)
-        shellcode = bytearray()
-        shellcode.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
-
-        # 1. domain = il2cpp_domain_get()
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_domain_get))
-        shellcode.extend(b'\xFF\xD0')
-
-        # 2. thread = il2cpp_thread_attach(domain)
-        shellcode.extend(b'\x48\x89\xC1')
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_thread_attach))
-        shellcode.extend(b'\xFF\xD0')
-
-        # 3. il2cpp_runtime_invoke(mi_breed, u, NULL, NULL) -> 原生發送繁殖訊號 (僅調用一次！)
-        shellcode.extend(b'\x48\xB9' + struct.pack('<Q', mi_breed))
-        shellcode.extend(b'\x48\xBA' + struct.pack('<Q', u))
-        shellcode.extend(b'\x4D\x31\xC0') # params = NULL
-        shellcode.extend(b'\x4D\x31\xC9') # exc = NULL
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke))
-        shellcode.extend(b'\xFF\xD0')
-
-        shellcode.extend(b'\x48\x83\xC4\x28') # add rsp, 0x28
-        shellcode.extend(b'\xC3') # ret
-
-        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(shellcode), 0x1000 | 0x2000, 0x40)
-        if not code_addr:
-            return False, "分配遠程代碼空間失敗"
-
-        written = ctypes.c_size_t()
-        kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(shellcode), len(shellcode), ctypes.byref(written))
-
-        h_thread = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_addr), None, 0, None)
-        if not h_thread:
-            kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
-            return False, "建立遠程記憶體執行緒失敗"
-
-        kernel32.WaitForSingleObject(h_thread, 5000)
-        kernel32.CloseHandle(h_thread)
-        kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+        # 使用經過嚴格線程註冊與堆疊保護的 invoke_il2cpp_method 原生調用
+        ok_invoke, inv_msg = self.invoke_il2cpp_method(mi_breed, u)
+        if not ok_invoke:
+            return False, f"調用 Breed 核心失敗: {inv_msg}"
 
         return True, f"⚡ 純記憶體訊號發送成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
 
