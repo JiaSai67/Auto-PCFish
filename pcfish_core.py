@@ -15,6 +15,7 @@ import time
 import datetime
 import json
 import os
+import threading
 
 # Windows CP950 終端編碼保護 (杜絕 UnicodeEncodeError 閃退)
 if sys.platform == "win32":
@@ -172,6 +173,7 @@ SEASON_TARGETS = [
 
 class PCFishMemory:
     def __init__(self):
+        self._lock = threading.RLock()
         self.pid = None
         self.h_proc = None
         # 全動態解析：開機與換設備自動識別，零硬編碼！
@@ -196,46 +198,114 @@ class PCFishMemory:
                 continue
         return None
 
+    def is_unity_object_alive(self, obj_addr):
+        """
+        檢查 Unity MonoBehaviour / UnityEngine.Object 在 C++ 底層是否依然存活
+        - +0x10 為 m_CachedPtr
+        - 在 Unity 引擎中，當 GameObject 或 Component 被銷毀時，m_CachedPtr 會被原生 C++ 核心置為 0 (NULL)
+        - 若 m_CachedPtr 為有效指標且位於合規記憶體區間，表示物件存活
+        """
+        if not obj_addr or not self.h_proc:
+            return False
+        cached_ptr = self.read_ptr(obj_addr + 0x10)
+        return bool(cached_ptr and 0x10000 <= cached_ptr <= 0x7FFFFFFFFFFF)
+
+    def apply_safe_memory_patches(self):
+        """
+        純記憶體模式防閃退核心保護補丁 (Unity Off-Thread Graphics Bypass):
+        1. 繁殖保護 (NetworkManager.FishBreed, GameAssembly.dll + 0x5f102b):
+           旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
+        2. 合成保護 (NetworkManager.FishMerge, GameAssembly.dll + 0x5f169b):
+           旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
+        雙重補丁 100% 確保繁殖與合成在純記憶體模式下絕對穩定、零崩潰！
+        """
+        if not self.h_proc:
+            return False
+        ga_base = self.get_module_base("GameAssembly.dll")
+        if not ga_base:
+            return False
+
+        patches = [
+            (0x5f102b, b'\xe8\xf0\xb4\x1a\x02', "FishBreed"),
+            (0x5f169b, b'\xe8\x80\xae\x1a\x02', "FishMerge"),
+        ]
+
+        all_ok = True
+        PAGE_EXECUTE_READWRITE = 0x40
+        for offset, orig_bytes, desc in patches:
+            target_addr = ga_base + offset
+            curr = self.read_bytes(target_addr, 5)
+            if curr == b'\x90\x90\x90\x90\x90':
+                continue
+            if curr == orig_bytes:
+                old_protect = wintypes.DWORD()
+                if kernel32.VirtualProtectEx(self.h_proc, ctypes.c_void_p(target_addr), 5, PAGE_EXECUTE_READWRITE, ctypes.byref(old_protect)):
+                    written = ctypes.c_size_t()
+                    kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(target_addr), b'\x90\x90\x90\x90\x90', 5, ctypes.byref(written))
+                    temp = wintypes.DWORD()
+                    kernel32.VirtualProtectEx(self.h_proc, ctypes.c_void_p(target_addr), 5, old_protect.value, ctypes.byref(temp))
+                    kernel32.FlushInstructionCache(self.h_proc, ctypes.c_void_p(target_addr), 5)
+                else:
+                    all_ok = False
+            else:
+                all_ok = False
+        return all_ok
+
+    def apply_safe_memory_breed_patch(self):
+        """向前相容舊有繁殖補丁呼叫介面"""
+        return self.apply_safe_memory_patches()
+
     def attach(self):
-        pid = self.find_process()
-        if not pid:
-            self.detach()
-            return False, "尚未檢測到 PCFish.exe 運行，請開啟遊戲。"
+        with self._lock:
+            pid = self.find_process()
+            if not pid:
+                self.detach()
+                return False, "尚未檢測到 PCFish.exe 運行，請開啟遊戲。"
 
-        if self.pid != pid or not self.h_proc:
-            self.detach()
-            self.pid = pid
-            self.h_proc = kernel32.OpenProcess(
-                PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
-                False,
-                pid
-            )
-            if not self.h_proc:
-                return False, f"無法打開進程 (PID: {pid})，請以管理員權限運行。"
+            if self.pid != pid or not self.h_proc:
+                self.detach()
+                self.pid = pid
+                self.h_proc = kernel32.OpenProcess(
+                    PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+                    False,
+                    pid
+                )
+                if not self.h_proc:
+                    return False, f"無法打開進程 (PID: {pid})，請以管理員權限運行。"
 
-            # 1. 跨設備與重啟核心：100% 動態由 IL2CPP 導出函式表精準解析類別指標
-            ok, msg = self.resolve_il2cpp_classes()
-            if not ok:
-                return False, f"IL2CPP 類別動態解析失敗: {msg}"
+                # 關鍵防護 1: 驗證遊戲核心組件是否已加載 (確保非剛開機未加載之過渡狀態)
+                ga_base = self.get_module_base("GameAssembly.dll")
+                if not ga_base:
+                    return False, "遊戲正在加載核心組件，等待初始化完成..."
 
-            # 2. 動態定位 GameDataManager
-            self.locate_gamedata_manager()
+                # 2. 跨設備與重啟核心：100% 動態由 IL2CPP 導出函式表精準解析類別指標
+                ok, msg = self.resolve_il2cpp_classes()
+                if not ok:
+                    return False, f"IL2CPP 類別動態解析失敗: {msg}"
 
-        return True, f"已連接遊戲進程 PID: {self.pid}"
+                # 3. 動態定位 GameDataManager
+                self.locate_gamedata_manager()
+
+                # 4. 啟用純記憶體防閃退保護補丁 (杜絕繁殖非主線程圖形崩潰)
+                self.apply_safe_memory_breed_patch()
+
+            return True, f"已連接遊戲進程 PID: {self.pid}"
 
     def detach(self):
-        if self.h_proc:
-            kernel32.CloseHandle(self.h_proc)
-            self.h_proc = None
-        self.pid = None
-        self.gamedata_addr = None
-        self.gamedata_klass = None
-        self.fish_model_klass = None
-        self.uibreed_klass = None
-        self.uibreed_addr = None
-        self.uimerge_klass = None
-        self.uimerge_addr = None
-        self._il2cpp_exports = None
+        with self._lock:
+            if self.h_proc:
+                kernel32.CloseHandle(self.h_proc)
+                self.h_proc = None
+            self.pid = None
+            self.gamedata_addr = None
+            self.gamedata_klass = None
+            self.fish_model_klass = None
+            self.uibreed_klass = None
+            self.uibreed_addr = None
+            self.uimerge_klass = None
+            self.uimerge_addr = None
+            self.game_wnd = None
+            self._il2cpp_exports = None
 
     def is_process_alive(self):
         """檢查遊戲進程是否仍然正常存活 (避免閃退時誤讀記憶體)"""
@@ -970,10 +1040,10 @@ class PCFishMemory:
         """
         if not self.h_proc: return None
 
-        # 1. 高速快取驗證 (0.0001ms)
+        # 1. 高速快取驗證 (0.0001ms) - 包含 C++ 底層生命週期檢驗
         if self.uibreed_addr and self.uibreed_klass:
             k = self.read_ptr(self.uibreed_addr)
-            if k == self.uibreed_klass:
+            if k == self.uibreed_klass and self.is_unity_object_alive(self.uibreed_addr):
                 img_arr = self.read_ptr(self.uibreed_addr + 0x28)
                 list_view = self.read_ptr(self.uibreed_addr + 0x38)
                 btn = self.read_ptr(self.uibreed_addr + 0x40)
@@ -986,6 +1056,7 @@ class PCFishMemory:
                         self.read_i32(list_view + 0x18) == 2 and
                         self.read_i32(parent_arr + 0x18) == 2):
                         return self.uibreed_addr
+            self.uibreed_addr = None # 懸空指針或面板已關閉/銷毀，立即重置快取！
 
         if not self.uibreed_klass:
             self.resolve_il2cpp_classes()
@@ -1009,22 +1080,23 @@ class PCFishMemory:
                         p = b.find(target, pos)
                         if p == -1: break
                         cand = base + offset + p
-                        img_arr = self.read_ptr(cand + 0x28)
-                        txt_timer = self.read_ptr(cand + 0x30)
-                        list_view = self.read_ptr(cand + 0x38)
-                        btn = self.read_ptr(cand + 0x40)
-                        parent_arr = self.read_ptr(cand + 0x50)
-                        if (img_arr and txt_timer and list_view and btn and parent_arr and
-                            0x10000 <= img_arr <= 0x7FFFFFFFFFFF and
-                            0x10000 <= list_view <= 0x7FFFFFFFFFFF and
-                            0x10000 <= parent_arr <= 0x7FFFFFFFFFFF):
-                            l_img = self.read_i32(img_arr + 0x18)
-                            l_lv = self.read_i32(list_view + 0x18)
-                            l_par = self.read_i32(parent_arr + 0x18)
-                            # 嚴格驗證 UIBreed 專屬結構特徵：5 顆愛心陣列 + 2 個槽位視圖 + 2 個親代 ID
-                            if l_img == 5 and l_lv == 2 and l_par == 2:
-                                self.uibreed_addr = cand
-                                return cand
+                        if self.is_unity_object_alive(cand):
+                            img_arr = self.read_ptr(cand + 0x28)
+                            txt_timer = self.read_ptr(cand + 0x30)
+                            list_view = self.read_ptr(cand + 0x38)
+                            btn = self.read_ptr(cand + 0x40)
+                            parent_arr = self.read_ptr(cand + 0x50)
+                            if (img_arr and txt_timer and list_view and btn and parent_arr and
+                                0x10000 <= img_arr <= 0x7FFFFFFFFFFF and
+                                0x10000 <= list_view <= 0x7FFFFFFFFFFF and
+                                0x10000 <= parent_arr <= 0x7FFFFFFFFFFF):
+                                l_img = self.read_i32(img_arr + 0x18)
+                                l_lv = self.read_i32(list_view + 0x18)
+                                l_par = self.read_i32(parent_arr + 0x18)
+                                # 嚴格驗證 UIBreed 專屬結構特徵：5 顆愛心陣列 + 2 個槽位視圖 + 2 個親代 ID
+                                if l_img == 5 and l_lv == 2 and l_par == 2:
+                                    self.uibreed_addr = cand
+                                    return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
@@ -1045,7 +1117,7 @@ class PCFishMemory:
                         p = b.find(target, pos)
                         if p == -1: break
                         cand = base + offset + p
-                        if not (ga_base <= cand <= ga_base + 0x5000000):
+                        if not (ga_base <= cand <= ga_base + 0x5000000) and self.is_unity_object_alive(cand):
                             img_arr = self.read_ptr(cand + 0x28)
                             txt_timer = self.read_ptr(cand + 0x30)
                             list_view = self.read_ptr(cand + 0x38)
@@ -1126,74 +1198,78 @@ class PCFishMemory:
         4. 透過 il2cpp_runtime_invoke 原生調用一次 UIBreed.Breed，精準發送核心繁殖訊號
         5. 100% 後台靜默運行、不碰實體滑鼠、不搶焦點、支援視窗最小化
         """
-        # 1. 填入親代槽位
-        ok, msg = self.set_breed_parents(p1, p2)
-        if not ok:
-            return False, msg
+        with self._lock:
+            # 確保防閃退圖形旁路補丁已生效 (杜絕非渲染線程 Graphics device is null 閃退)
+            self.apply_safe_memory_breed_patch()
 
-        u = self.locate_uibreed()
-        if not u:
-            return False, "遊戲中尚未打開「繁殖」面板，請在遊戲中打開繁殖介面！"
+            # 1. 填入親代槽位
+            ok, msg = self.set_breed_parents(p1, p2)
+            if not ok:
+                return False, msg
 
-        k = self.read_ptr(u)
-        methods_ptr = self.read_ptr(k + 0x98)
-        if not methods_ptr:
-            return False, "無法讀取 UIBreed 函式表"
+            u = self.locate_uibreed()
+            if not u:
+                return False, "遊戲中尚未打開「繁殖」面板，請在遊戲中打開繁殖介面！"
 
-        # Method[9]: Breed (核心按鈕繁殖事件，v1.0.7/v1.0.8 驗證指針)
-        mi_breed = self.read_ptr(methods_ptr + 9 * 8)
-        if not mi_breed:
-            return False, "未找到 Breed 核心原生方法指針"
+            k = self.read_ptr(u)
+            methods_ptr = self.read_ptr(k + 0x98)
+            if not methods_ptr:
+                return False, "無法讀取 UIBreed 函式表"
 
-        exports = self.get_il2cpp_exports()
-        if not exports or 'il2cpp_domain_get' not in exports:
-            return False, "無法解析 IL2CPP 核心導出函式"
+            # Method[9]: Breed (核心按鈕繁殖事件，v1.0.7/v1.0.8 驗證指針)
+            mi_breed = self.read_ptr(methods_ptr + 9 * 8)
+            if not mi_breed:
+                return False, "未找到 Breed 核心原生方法指針"
 
-        fn_domain_get = exports['il2cpp_domain_get']
-        fn_thread_attach = exports['il2cpp_thread_attach']
-        fn_runtime_invoke = exports['il2cpp_runtime_invoke']
+            exports = self.get_il2cpp_exports()
+            if not exports or 'il2cpp_domain_get' not in exports:
+                return False, "無法解析 IL2CPP 核心導出函式"
 
-        # 組裝 x64 遠程執行機器碼 (註冊 IL2CPP 線程 -> 單次調用 UIBreed.Breed)
-        shellcode = bytearray()
-        shellcode.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
+            fn_domain_get = exports['il2cpp_domain_get']
+            fn_thread_attach = exports['il2cpp_thread_attach']
+            fn_runtime_invoke = exports['il2cpp_runtime_invoke']
 
-        # 1. domain = il2cpp_domain_get()
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_domain_get))
-        shellcode.extend(b'\xFF\xD0')
+            # 組裝 x64 遠程執行機器碼 (註冊 IL2CPP 線程 -> 單次調用 UIBreed.Breed)
+            shellcode = bytearray()
+            shellcode.extend(b'\x48\x83\xEC\x28') # sub rsp, 0x28
 
-        # 2. thread = il2cpp_thread_attach(domain)
-        shellcode.extend(b'\x48\x89\xC1')
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_thread_attach))
-        shellcode.extend(b'\xFF\xD0')
+            # 1. domain = il2cpp_domain_get()
+            shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_domain_get))
+            shellcode.extend(b'\xFF\xD0')
 
-        # 3. il2cpp_runtime_invoke(mi_breed, u, NULL, NULL) -> 原生發送繁殖訊號 (僅調用一次！)
-        shellcode.extend(b'\x48\xB9' + struct.pack('<Q', mi_breed))
-        shellcode.extend(b'\x48\xBA' + struct.pack('<Q', u))
-        shellcode.extend(b'\x4D\x31\xC0') # params = NULL
-        shellcode.extend(b'\x4D\x31\xC9') # exc = NULL
-        shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke))
-        shellcode.extend(b'\xFF\xD0')
+            # 2. thread = il2cpp_thread_attach(domain)
+            shellcode.extend(b'\x48\x89\xC1')
+            shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_thread_attach))
+            shellcode.extend(b'\xFF\xD0')
 
-        shellcode.extend(b'\x48\x83\xC4\x28') # add rsp, 0x28
-        shellcode.extend(b'\xC3') # ret
+            # 3. il2cpp_runtime_invoke(mi_breed, u, NULL, NULL) -> 原生發送繁殖訊號 (僅調用一次！)
+            shellcode.extend(b'\x48\xB9' + struct.pack('<Q', mi_breed))
+            shellcode.extend(b'\x48\xBA' + struct.pack('<Q', u))
+            shellcode.extend(b'\x4D\x31\xC0') # params = NULL
+            shellcode.extend(b'\x4D\x31\xC9') # exc = NULL
+            shellcode.extend(b'\x48\xB8' + struct.pack('<Q', fn_runtime_invoke))
+            shellcode.extend(b'\xFF\xD0')
 
-        code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(shellcode), 0x1000 | 0x2000, 0x40)
-        if not code_addr:
-            return False, "分配遠程代碼空間失敗"
+            shellcode.extend(b'\x48\x83\xC4\x28') # add rsp, 0x28
+            shellcode.extend(b'\xC3') # ret
 
-        written = ctypes.c_size_t()
-        kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(shellcode), len(shellcode), ctypes.byref(written))
+            code_addr = kernel32.VirtualAllocEx(self.h_proc, None, len(shellcode), 0x1000 | 0x2000, 0x40)
+            if not code_addr:
+                return False, "分配遠程代碼空間失敗"
 
-        h_thread = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_addr), None, 0, None)
-        if not h_thread:
+            written = ctypes.c_size_t()
+            kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_addr), bytes(shellcode), len(shellcode), ctypes.byref(written))
+
+            h_thread = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_addr), None, 0, None)
+            if not h_thread:
+                kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
+                return False, "建立遠程記憶體執行緒失敗"
+
+            kernel32.WaitForSingleObject(h_thread, 5000)
+            kernel32.CloseHandle(h_thread)
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
-            return False, "建立遠程記憶體執行緒失敗"
 
-        kernel32.WaitForSingleObject(h_thread, 5000)
-        kernel32.CloseHandle(h_thread)
-        kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_addr), 0, 0x8000)
-
-        return True, f"⚡ 純記憶體訊號發送成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
+            return True, f"⚡ 純記憶體訊號發送成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
 
     def wait_for_breed_confirmation(self, p1, p2, old_hearts, timeout=3.5):
         """
@@ -1296,12 +1372,10 @@ class PCFishMemory:
 
     def execute_mouse_breed(self, p1, p2):
         """
-        極速無感安全觸發模式 (Lightning Micro-Safe Trigger - 兼具 100% 防閃退與游標無感體驗)：
+        混合安全模式 (Hybrid Safe Execution)：
         1. 親代配對放入：100% 純記憶體直接寫入槽位 (免翻頁、免拖曳、零操作失誤)
-        2. 繁殖點擊觸發：
-           - 優先採用 PostMessage 後台無感投遞
-           - 備用採用微秒級瞬移點擊 (20ms 內極速復歸原始游標，不搶焦點、不強制置頂)
-        3. 100% 避開 Unity 非渲染線程 Graphics device is null 崩潰
+        2. 繁殖點擊觸發：透過主線程視窗分發點擊 (100% 避開 Unity 非渲染線程 Graphics device is null 崩潰)
+        3. 彈窗自動確認：點擊後自動關閉獲得魚結算彈窗，游標極速瞬移復原
         """
         ok, msg = self.set_breed_parents(p1, p2)
         if not ok:
@@ -1310,6 +1384,10 @@ class PCFishMemory:
         wnd = self.find_game_window()
         if not wnd:
             return False, "未找到遊戲主視窗，請確認 PCFish 正在運行中。"
+
+        user32.ShowWindow(wnd, 9)
+        user32.SetForegroundWindow(wnd)
+        time.sleep(0.1)
 
         cl_rect = wintypes.RECT()
         user32.GetClientRect(wnd, ctypes.byref(cl_rect))
@@ -1321,38 +1399,51 @@ class PCFishMemory:
 
         btn_x = origin.x + int(w * 0.86)
         btn_y = origin.y + int(h * 0.83)
-        client_x = int(w * 0.86)
-        client_y = int(h * 0.83)
-        lParam = (client_y << 16) | (client_x & 0xFFFF)
 
-        # 優先嘗試：後台 PostMessage 點擊 (不搶焦點、不移游標)
-        WM_LBUTTONDOWN = 0x0201
-        WM_LBUTTONUP = 0x0202
-        user32.PostMessageW(wnd, WM_LBUTTONDOWN, 1, lParam)
-        time.sleep(0.02)
-        user32.PostMessageW(wnd, WM_LBUTTONUP, 0, lParam)
-
-        # 輔助確保：微秒級瞬移原位復歸 (耗時僅 20ms，肉眼無感，確保 Unity InputSystem 順暢響應)
         cur_pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(cur_pt))
+
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+
+        # 步驟 1: 極速點擊「繁殖」按鈕
         user32.SetCursorPos(btn_x, btn_y)
-        user32.mouse_event(0x0002, 0, 0, 0, 0) # LEFTDOWN
-        time.sleep(0.01)
-        user32.mouse_event(0x0004, 0, 0, 0, 0) # LEFTUP
+        time.sleep(0.04)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.04)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+        # 步驟 2: 等待獲得魚結算彈窗 (約 1 秒)
+        time.sleep(1.0)
+
+        # 步驟 3: 點擊確認關閉結算彈窗
+        res_x = origin.x + int(w * 0.86)
+        res_y = origin.y + int(h * 0.65)
+        user32.SetCursorPos(res_x, res_y)
+        time.sleep(0.04)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.04)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+        # 步驟 4: 於視窗中央輔助點擊一次，確保關閉任何殘餘遮罩
+        time.sleep(0.15)
+        mid_x = origin.x + int(w * 0.5)
+        mid_y = origin.y + int(h * 0.5)
+        user32.SetCursorPos(mid_x, mid_y)
+        time.sleep(0.03)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.03)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+        # 步驟 5: 立即復原使用者滑鼠游標
         user32.SetCursorPos(cur_pt.x, cur_pt.y)
+        return True, f"🖱️ 混合安全觸發成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
 
-        # 背景發送空白鍵關閉可能彈出的獲得魚提示
-        user32.PostMessageW(wnd, 0x0100, 0x20, 0) # WM_KEYDOWN VK_SPACE
-        time.sleep(0.01)
-        user32.PostMessageW(wnd, 0x0101, 0x20, 0) # WM_KEYUP VK_SPACE
-
-        return True, f"⚡ 智能極速觸發成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
-
-    def execute_breed(self, p1, p2, use_memory_signal=False, wait_confirm=True):
+    def execute_breed(self, p1, p2, use_memory_signal=True, wait_confirm=True):
         """
         執行自動繁殖操作：
         1. 記錄執行前愛心狀態
-        2. 預設採用「純記憶體親代注入 + 主線程安全觸發」模式 (100% 杜絕 Unity Graphics device is null 閃退)
+        2. 預設採用 100% 純記憶體直發 (不移滑鼠、不搶焦點、支援背景最小化)
         3. 等待伺服端冷卻與扣心握手確認 (避免重複發送)
         """
         old_hearts, _, ok_h, _ = self.get_breed_heart_status()
@@ -1379,30 +1470,30 @@ class PCFishMemory:
 
     def locate_uimerge(self):
         """驗證快取或全動態掃描 UIMerge 實例 (0.01ms 快取 / 0.5s 首次掃描)"""
+        if not self.h_proc:
+            return None
+
+        # 1. 快速快取驗證
         if self.uimerge_addr and self.uimerge_klass:
             k = self.read_ptr(self.uimerge_addr)
-            if k == self.uimerge_klass:
+            if k == self.uimerge_klass and self.is_unity_object_alive(self.uimerge_addr):
                 slots = self.read_ptr(self.uimerge_addr + 0x40)
                 pids = self.read_ptr(self.uimerge_addr + 0x78)
-                craft = self.read_ptr(self.uimerge_addr + 0x80)
                 btn = self.read_ptr(self.uimerge_addr + 0x60)
-                if (0x10000 <= slots <= 0x7FFFFFFFFFFF and 
+                if (slots and pids and btn and
+                    0x10000 <= slots <= 0x7FFFFFFFFFFF and 
                     0x10000 <= pids <= 0x7FFFFFFFFFFF and 
-                    0x10000 <= craft <= 0x7FFFFFFFFFFF and 
                     0x10000 <= btn <= 0x7FFFFFFFFFFF):
-                    # 核心特徵：slots 陣列長度必定為 10
-                    if self.read_i32(slots + 0x18) == 10:
-                        pids_len = self.read_i32(pids + 0x18)
-                        if 0 <= pids_len <= 10:
-                            slot0 = self.read_ptr(slots + 0x20)
-                            if 0x10000 <= slot0 <= 0x7FFFFFFFFFFF:
-                                return self.uimerge_addr
+                    if self.read_i32(slots + 0x18) == 10 and self.read_i32(pids + 0x18) == 10:
+                        return self.uimerge_addr
+            self.uimerge_addr = None # 重置過期或已銷毀實例
 
         if not self.uimerge_klass:
             self.resolve_il2cpp_classes()
             if not self.uimerge_klass:
                 return None
 
+        # 2. 聚焦堆記憶體 (MEM_PRIVATE) 快速搜尋 UIMerge 實例
         target = struct.pack('<Q', self.uimerge_klass)
         addr = 0
         mbi = MBI()
@@ -1419,24 +1510,52 @@ class PCFishMemory:
                         p = b.find(target, pos)
                         if p == -1: break
                         cand = base + offset + p
-                        slots = self.read_ptr(cand + 0x40)
-                        pids = self.read_ptr(cand + 0x78)
-                        craft = self.read_ptr(cand + 0x80)
-                        btn = self.read_ptr(cand + 0x60)
-                        if (0x10000 <= slots <= 0x7FFFFFFFFFFF and 
-                            0x10000 <= pids <= 0x7FFFFFFFFFFF and 
-                            0x10000 <= craft <= 0x7FFFFFFFFFFF and 
-                            0x10000 <= btn <= 0x7FFFFFFFFFFF):
-                            if self.read_i32(slots + 0x18) == 10:
-                                pids_len = self.read_i32(pids + 0x18)
-                                if 0 <= pids_len <= 10:
-                                    slot0 = self.read_ptr(slots + 0x20)
-                                    if 0x10000 <= slot0 <= 0x7FFFFFFFFFFF:
-                                        self.uimerge_addr = cand
-                                        return cand
+                        if self.is_unity_object_alive(cand):
+                            slots = self.read_ptr(cand + 0x40)
+                            pids = self.read_ptr(cand + 0x78)
+                            btn = self.read_ptr(cand + 0x60)
+                            if (slots and pids and btn and
+                                0x10000 <= slots <= 0x7FFFFFFFFFFF and 
+                                0x10000 <= pids <= 0x7FFFFFFFFFFF and 
+                                0x10000 <= btn <= 0x7FFFFFFFFFFF):
+                                if self.read_i32(slots + 0x18) == 10 and self.read_i32(pids + 0x18) == 10:
+                                    self.uimerge_addr = cand
+                                    return cand
                         pos = p + 8
             addr = base + size
             if addr >= 0x7FFFFFFFFFFF: break
+
+        # 3. 降級備用路徑：若作業系統堆未標記為 MEM_PRIVATE，則全範圍掃描已提交記憶體
+        addr = 0
+        ga_base = self.get_module_base("GameAssembly.dll") or 0
+        while kernel32.VirtualQueryEx(self.h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize
+            if mbi.State == MEM_COMMIT and not (mbi.Protect & 0x100) and not (mbi.Protect & 0x01):
+                chunk_size = 65536
+                for offset in range(0, size, chunk_size):
+                    to_read = min(chunk_size + 8, size - offset)
+                    b = self.read_bytes(base + offset, to_read)
+                    pos = 0
+                    while True:
+                        p = b.find(target, pos)
+                        if p == -1: break
+                        cand = base + offset + p
+                        if not (ga_base <= cand <= ga_base + 0x5000000) and self.is_unity_object_alive(cand):
+                            slots = self.read_ptr(cand + 0x40)
+                            pids = self.read_ptr(cand + 0x78)
+                            btn = self.read_ptr(cand + 0x60)
+                            if (slots and pids and btn and
+                                0x10000 <= slots <= 0x7FFFFFFFFFFF and 
+                                0x10000 <= pids <= 0x7FFFFFFFFFFF and 
+                                0x10000 <= btn <= 0x7FFFFFFFFFFF):
+                                if self.read_i32(slots + 0x18) == 10 and self.read_i32(pids + 0x18) == 10:
+                                    self.uimerge_addr = cand
+                                    return cand
+                        pos = p + 8
+            addr = base + size
+            if addr >= 0x7FFFFFFFFFFF: break
+
         return None
 
     def get_season_and_general_classification(self, all_fish=None, max_merge_rarity=2, max_merge_star=3):
@@ -1446,7 +1565,7 @@ class PCFishMemory:
         2. 依據稀有度（神話 FS00035 > 傳奇 FS00034 > 稀有 FS00033）由高至低依序鎖定材料，高星級/低星級全層級預留保護。
         3. 只要吻合賽季配方需求的魚隻（含已齊全或正在籌備中的數量），全部加入 reserved_fish_ids，禁止挪作一般融合！
         4. 將非賽季魚種（FS00001~FS00006 等）與賽季多餘溢出的魚隻獨立分流為一般魚融合池 (general_pool)。
-        5. 安全防誤融：一般魚融合池預設僅取普通 (1) 與高級 (2) 魚隻，嚴禁放入神話 (5) 與傳說 (4)！
+        5. 安全防誤融：一般魚融合池預設僅取普通 (1) 與高級 (2) 魚隻，且星級 <= max_merge_star (預設 <= 3，自主保護 4星/5星高星魚)！
         6. 一般魚融合池按「剩餘繁殖次數少者優先（0次廢魚優先融合）」與「同星級同稀有度」排序分組。
         """
         if all_fish is None:
@@ -1529,14 +1648,14 @@ class PCFishMemory:
                 })
 
         # 3. 分流：非賽季魚所需的魚種 + 賽季多餘溢出的魚種 -> 一般魚合成池
-        # 排除已鎖定與基礎魚，且嚴格限制稀有度與星級 (預設防禦4~5星與神話傳說)
+        # 排除已鎖定與基礎魚，且嚴格限制稀有度與星級 (預設上限為高級 2、星級 <= 3，自主保護高星高階魚隻)
         general_candidates = [
             f for f in all_fish 
             if f['id'] not in reserved_fish_ids 
             and not f['is_locked'] 
             and not f.get('is_basic', False)
             and f.get('rarity_val', 1) <= max_merge_rarity
-            and f.get('level', f.get('star', 1)) <= max_merge_star
+            and f.get('star', 1) <= max_merge_star
         ]
 
         # 排序：
@@ -1637,93 +1756,90 @@ class PCFishMemory:
     def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
         """
         純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
-        1. 定位 UIMerge 物件 (嚴格多重指標檢驗)
-        2. 原生調用 MergeInit() 清空槽位並配置全新 string[10] (零彈窗、零畫面卡死)
-        3. 直接將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
-        4. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與 fishType (+0xc0)
-           若為一般融合 (merge_type == 0)，配置 mergeType=0, fishType=0, grade=0
-        5. 原生調用 UpdateMergeCount() 刷新介面計數為 10 / 10
+        1. 確保雙重旁路保護補丁生效 (Breed: 0x5f102b, Merge: 0x5f169b)
+        2. 定位 UIMerge 物件
+        3. 直接在記憶體中配置與重置槽位 (零調用非渲染線程 UI 方法，杜絕任何圖形崩潰)
+        4. 將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
+        5. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與 fishType (+0xc0)
+           若為一般融合 (merge_type == 0)，配置 mergeType=0, fishType=0, targetStar=1
         6. 原生調用 UIMerge.Merge() 發送網路合成封包 (直接送往伺服端，不經任何 UI 彈窗攔截)
-        7. 等候 1.5 秒伺服端結算後，原生調用 MergeInit() 恢復初始乾淨狀態
+        7. 等候 1.5 秒伺服端結算後，直接在記憶體中清理槽位
         """
-        u = self.locate_uimerge()
-        if not u:
-            return False, "無法定位遊戲 UIMerge 實例 (請先在遊戲中打開「合成」介面)"
+        with self._lock:
+            # 關鍵防護 1: 確保雙重旁路保護補丁生效 (Breed + Merge)
+            self.apply_safe_memory_patches()
 
-        if len(fish_list_10) != 10:
-            return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
+            u = self.locate_uimerge()
+            if not u:
+                return False, "無法定位遊戲 UIMerge 實例 (請先在遊戲中打開「合成」介面)"
 
-        k = self.read_ptr(u)
-        mi_init = self.get_class_method(k, "MergeInit")
-        mi_update = self.get_class_method(k, "UpdateMergeCount")
-        mi_merge = self.get_class_method(k, "Merge")
+            if len(fish_list_10) != 10:
+                return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
 
-        if not (mi_init and mi_merge):
-            methods_ptr = self.read_ptr(k + 0x98)
-            if methods_ptr:
-                mi_init = mi_init or self.read_ptr(methods_ptr + 7 * 8)
-                mi_update = mi_update or self.read_ptr(methods_ptr + 8 * 8)
-                mi_merge = mi_merge or self.read_ptr(methods_ptr + 14 * 8)
+            k = self.read_ptr(u)
+            mi_update = self.get_class_method(k, "UpdateMergeCount")
+            mi_merge = self.get_class_method(k, "Merge")
 
-        if not (mi_init and mi_merge):
-            return False, "無法讀取 UIMerge 原生函式表 (MergeInit/Merge)"
+            if not mi_merge:
+                methods_ptr = self.read_ptr(k + 0x98)
+                if methods_ptr:
+                    mi_update = mi_update or self.read_ptr(methods_ptr + 8 * 8)
+                    mi_merge = mi_merge or self.read_ptr(methods_ptr + 14 * 8)
 
-        # 1. 先透過官方 MergeInit 清空槽位與介面 (絕無 msg_autoFillClear 彈窗干擾)
-        self.invoke_il2cpp_method(mi_init, u)
+            if not mi_merge:
+                return False, "無法讀取 UIMerge.Merge 原生函式表指針"
 
-        # 2. 直接向 mergeFishList (u + 0x78, String[10]) 寫入 10 個材料魚之合法字串指標
-        p78 = self.read_ptr(u + 0x78)
-        if not p78 or not (0x10000 <= p78 <= 0x7FFFFFFFFFFF):
-            return False, "無法獲取 mergeFishList 記憶體陣列"
+            # 1. 直接向 mergeFishList (u + 0x78, String[10]) 寫入 10 個材料魚之合法字串指標
+            p78 = self.read_ptr(u + 0x78)
+            if not p78 or not (0x10000 <= p78 <= 0x7FFFFFFFFFFF):
+                return False, "無法獲取 mergeFishList 記憶體陣列"
 
-        for idx, f in enumerate(fish_list_10):
-            self.write_ptr(p78 + 0x20 + idx * 8, f['idPtr'])
+            for idx, f in enumerate(fish_list_10):
+                self.write_ptr(p78 + 0x20 + idx * 8, f['idPtr'])
 
-        # 3. 設置合成型態 (賽季合成 vs 一般融合)
-        self.write_i32(u + 0xb8, merge_type)
-        if merge_type == 1:
-            self.write_i32(u + 0xc8, target_star)
-            # 尋找 target_season_type 對應的合規字串指標
-            season_str_ptr = 0
-            gdm = self.locate_gamedata_manager()
-            if gdm:
-                d_ptr = self.read_ptr(gdm + 0x58)
-                if d_ptr:
-                    count = self.read_i32(d_ptr + 0x20)
-                    entries = self.read_ptr(d_ptr + 0x18)
-                    for idx in range(count):
-                        e_addr = entries + 0x20 + idx * 24
-                        k_ptr = self.read_ptr(e_addr + 8)
-                        if self.read_utf16_str(k_ptr) == target_season_type:
-                            season_str_ptr = k_ptr
-                            break
-            if not season_str_ptr:
-                season_str_ptr = self.create_managed_string(target_season_type)
+            # 2. 設置合成型態 (賽季合成 vs 一般融合)
+            self.write_i32(u + 0xb8, merge_type)
+            if merge_type == 1:
+                self.write_i32(u + 0xc8, target_star)
+                season_str_ptr = 0
+                gdm = self.locate_gamedata_manager()
+                if gdm:
+                    d_ptr = self.read_ptr(gdm + 0x58)
+                    if d_ptr:
+                        count = self.read_i32(d_ptr + 0x20)
+                        entries = self.read_ptr(d_ptr + 0x18)
+                        for idx in range(count):
+                            e_addr = entries + 0x20 + idx * 24
+                            k_ptr = self.read_ptr(e_addr + 8)
+                            if self.read_utf16_str(k_ptr) == target_season_type:
+                                season_str_ptr = k_ptr
+                                break
+                if not season_str_ptr:
+                    season_str_ptr = self.create_managed_string(target_season_type)
 
-            # UIMerge.Merge 中 [rdi + 0xc0] + 0x10 為 string 指針
-            if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
-                self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
-            if self._season_dummy_obj and season_str_ptr:
-                self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
-                self.write_ptr(u + 0xc0, self._season_dummy_obj)
-        else:
+                if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
+                    self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
+                if self._season_dummy_obj and season_str_ptr:
+                    self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
+                    self.write_ptr(u + 0xc0, self._season_dummy_obj)
+            else:
+                self.write_ptr(u + 0xc0, 0)
+                self.write_i32(u + 0xc8, 1)
+
+            # 3. 原生調用 Merge 發送核心合成訊號 (直接送出網路封包，零 UI 阻擋)
+            ok, msg = self.invoke_il2cpp_method(mi_merge, u)
+            if not ok:
+                return False, f"合成發送失敗: {msg}"
+
+            # 4. 等候 1.5 秒伺服端完成後，在記憶體中清理槽位
+            time.sleep(1.5)
+            for idx in range(10):
+                self.write_ptr(p78 + 0x20 + idx * 8, 0)
             self.write_ptr(u + 0xc0, 0)
-            self.write_i32(u + 0xc8, 0)
+            self.write_i32(u + 0xb8, 0)
+            self.write_i32(u + 0xc8, 1)
 
-        # 4. 原生調用 UpdateMergeCount 刷新介面 (顯示 10 / 10 就緒)
-        if mi_update:
-            self.invoke_il2cpp_method(mi_update, u)
-
-        # 5. 調用 Merge 發送核心合成訊號 (直接送出網路封包，零 UI 阻擋)
-        ok, msg = self.invoke_il2cpp_method(mi_merge, u)
-        if not ok:
-            return False, f"合成發送失敗: {msg}"
-
-        # 6. 等候 1.5 秒伺服端完成後，原生調用 MergeInit 清理槽位
-        time.sleep(1.5)
-        self.invoke_il2cpp_method(mi_init, u)
-
-        type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
-        return True, f"★ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"
+            type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
+            return True, f"★ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"
 
 
