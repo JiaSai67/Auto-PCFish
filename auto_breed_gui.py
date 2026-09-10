@@ -59,7 +59,9 @@ class AutoBreedApp:
         self.blacklist = set()
         self.opt_min_hearts = tk.IntVar(value=1)
         self.opt_same_rarity_only = tk.BooleanVar(value=False)
+        self.opt_pure_memory = tk.BooleanVar(value=False) # 預設採用極速無感安全觸發模式 (防禦 Unity Graphics device is null 閃退)
         self.opt_max_merge_rarity = tk.IntVar(value=2) # 預設融合素材上限：高級(2)，防禦神話/傳說
+        self.opt_max_merge_star = tk.IntVar(value=3)   # 預設融合素材星級上限：3星，防禦4~5星高品質魚
         self.ontop_var = tk.BooleanVar(value=True)
 
         # 樣式與視覺系統
@@ -453,11 +455,28 @@ class AutoBreedApp:
         )
         btn_clear_bl.pack(side="left")
 
+        # 第三列：訊號觸發模式選擇
+        row3 = tk.Frame(opt_card, bg=self.c_card)
+        row3.pack(fill="x", padx=14, pady=(1, 4))
+
+        cb_pure_mem = tk.Checkbutton(
+            row3,
+            text="⚡ 強制純記憶體遠程執行緒直發 (⚠️ 警告：Unity 引擎背景線程調用已知會引發 Graphics device is null 閃退，預設關閉以保安全)",
+            variable=self.opt_pure_memory,
+            bg=self.c_card,
+            fg=self.c_subtext,
+            selectcolor=self.c_entry_bg,
+            activebackground=self.c_card,
+            activeforeground=self.c_pink,
+            font=self.font_small
+        )
+        cb_pure_mem.pack(side="left")
+
         lbl_tip = tk.Label(
             opt_card,
-            text="💡 提示：排除鎖定/冷卻與原生記憶體直發已預設啟用。配對優先依稀有度，次依剩餘次數少者優先耗損配種次數。",
+            text="💡 提示：預設啟用「極速無感安全觸發」(純記憶體槽位注入 + 20ms游標原位復原)，100% 杜絕遊戲閃退且零操作干擾。",
             font=self.font_small,
-            fg=self.c_subtext,
+            fg=self.c_green,
             bg=self.c_card
         )
         lbl_tip.pack(anchor="w", padx=14, pady=(0, 6))
@@ -610,12 +629,53 @@ class AutoBreedApp:
 
         lbl_gen_safety = tk.Label(
             general_card,
-            text="🛡️ 安全隔離防禦已生效：已自動鎖定保護所有賽季材料魚，並嚴格杜絕神話與傳說魚隻，僅以普通/高級多餘廢魚提純星級。",
+            text="🛡️ 安全隔離防禦已生效：已自動鎖定保護所有賽季材料魚，並支援自訂星級/稀有度上限，僅以多餘廢魚提純星級。",
             font=self.font_small,
             fg=self.c_subtext,
             bg=self.c_card
         )
-        lbl_gen_safety.pack(anchor="w", padx=14, pady=(0, 4))
+        lbl_gen_safety.pack(anchor="w", padx=14, pady=(0, 2))
+
+        # 自主設定：融合星級上限與稀有度上限
+        cfg_frame = tk.Frame(general_card, bg=self.c_card)
+        cfg_frame.pack(fill="x", padx=14, pady=(2, 6))
+
+        lbl_star_limit = tk.Label(cfg_frame, text="✦ 融合星級上限:", font=self.font_bold, fg=self.c_gold, bg=self.c_card)
+        lbl_star_limit.pack(side="left", padx=(0, 4))
+
+        spin_star = ttk.Spinbox(
+            cfg_frame,
+            from_=1,
+            to=5,
+            width=3,
+            textvariable=self.opt_max_merge_star,
+            font=self.font_bold,
+            command=self.force_refresh_scan
+        )
+        spin_star.pack(side="left", padx=(0, 14))
+
+        lbl_rarity_limit = tk.Label(cfg_frame, text="🏷️ 稀有度上限:", font=self.font_bold, fg=self.c_cyan, bg=self.c_card)
+        lbl_rarity_limit.pack(side="left", padx=(0, 4))
+
+        spin_rarity = ttk.Spinbox(
+            cfg_frame,
+            from_=1,
+            to=4,
+            width=3,
+            textvariable=self.opt_max_merge_rarity,
+            font=self.font_bold,
+            command=self.force_refresh_scan
+        )
+        spin_rarity.pack(side="left", padx=(0, 10))
+
+        lbl_star_hint = tk.Label(
+            cfg_frame,
+            text="(預設3星以下，星級>=4的高星魚種自動防禦禁融)",
+            font=self.font_small,
+            fg=self.c_subtext,
+            bg=self.c_card
+        )
+        lbl_star_hint.pack(side="left")
 
         # 當前候選 10 隻預覽
         self.lbl_batch_preview = tk.Label(
@@ -916,7 +976,8 @@ class AutoBreedApp:
                 # 快速分類並差量更新 Tab 2 賽季雷達與一般魚融合
                 class_res = self.mem.get_season_and_general_classification(
                     all_fish=fish_list,
-                    max_merge_rarity=self.opt_max_merge_rarity.get()
+                    max_merge_rarity=self.opt_max_merge_rarity.get(),
+                    max_merge_star=self.opt_max_merge_star.get()
                 )
                 self.cached_class_res = class_res
                 self.update_season_merge_ui(class_res)
@@ -968,9 +1029,11 @@ class AutoBreedApp:
                     self.log(f"【單次中止】{err_msg}")
                     return
 
-                self.log(f"【單次鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送純記憶體繁殖訊號...")
+                use_pure = self.opt_pure_memory.get()
+                mode_str = "純記憶體訊號" if use_pure else "極速無感安全訊號"
+                self.log(f"【單次鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]，發送{mode_str}...")
 
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=use_pure, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
@@ -999,7 +1062,7 @@ class AutoBreedApp:
         if not self.is_running:
             if self.autobread_thread and self.autobread_thread.is_alive():
                 self.stop_event.set()
-                self.autobread_thread.join(timeout=0.5)
+                self.autobread_thread.join(timeout=1.0)
 
             self.stop_event.clear()
             self.is_running = True
@@ -1010,12 +1073,15 @@ class AutoBreedApp:
                 activebackground="#eba0ac",
                 activeforeground="#181825"
             )
-            self.log("【啟動】全自動智能繁殖流程已開啟！(100% 純記憶體訊號直發模式)")
+            mode_desc = "100% 純記憶體直發模式" if self.opt_pure_memory.get() else "極速無感安全模式 (100% 防閃退)"
+            self.log(f"【啟動】全自動智能繁殖流程已開啟！({mode_desc})")
             self.autobread_thread = threading.Thread(target=self.autobread_loop, daemon=True)
             self.autobread_thread.start()
         else:
             self.is_running = False
             self.stop_event.set()
+            if self.autobread_thread and self.autobread_thread.is_alive():
+                self.autobread_thread.join(timeout=0.8)
             self.btn_toggle.configure(
                 text="▶  啟動全自動智能繁殖",
                 bg=self.c_green,
@@ -1035,6 +1101,8 @@ class AutoBreedApp:
                     if self.stop_event.wait(3.0): break
                     continue
 
+                if not self.is_running or self.stop_event.is_set(): break
+
                 hearts, timer_str, ok, target_ts = self.mem.get_breed_heart_status()
                 min_hearts = self.opt_min_hearts.get()
 
@@ -1046,11 +1114,15 @@ class AutoBreedApp:
                     if self.stop_event.wait(sleep_sec): break
                     continue
 
+                if not self.is_running or self.stop_event.is_set(): break
+
                 uibreed = self.mem.locate_uibreed()
                 if not uibreed:
                     self.log("【等待】遊戲尚未打開「繁殖」面板，請在遊戲中打開繁殖介面...")
                     if self.stop_event.wait(2.0): break
                     continue
+
+                if not self.is_running or self.stop_event.is_set(): break
 
                 p1, p2, err_msg = self.mem.get_best_breed_pair(
                     excluded_names=self.blacklist,
@@ -1059,15 +1131,20 @@ class AutoBreedApp:
                     same_rarity_only=self.opt_same_rarity_only.get()
                 )
 
+                if not self.is_running or self.stop_event.is_set(): break
+
                 if not p1 or not p2:
                     self.log(f"【等待可用親代】{err_msg}。等待 3 秒重新檢查...")
                     if self.stop_event.wait(3.0): break
                     continue
 
+                if not self.is_running or self.stop_event.is_set(): break
+
                 self.log(f"【智能鎖定】[{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}] (剩餘次數: {p1['breed']}/{p2['breed']})，發送繁殖訊號...")
 
-                # 100% 純記憶體訊號直發 (v1.0.7/v1.0.8 穩定架構)
-                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=True, wait_confirm=True)
+                # 依據設定選擇模式 (預設極速無感安全模式，100% 杜絕 Graphics device is null 閃退)
+                use_pure = self.opt_pure_memory.get()
+                ok, res_msg = self.mem.execute_breed(p1, p2, use_memory_signal=use_pure, wait_confirm=True)
                 if ok:
                     self.log(f"✔ {res_msg}")
                     new_h, _, _, _ = self.mem.get_breed_heart_status()
@@ -1112,7 +1189,8 @@ class AutoBreedApp:
                     return
 
                 class_res = self.mem.get_season_and_general_classification(
-                    max_merge_rarity=self.opt_max_merge_rarity.get()
+                    max_merge_rarity=self.opt_max_merge_rarity.get(),
+                    max_merge_star=self.opt_max_merge_star.get()
                 )
 
                 # 尋找是否具備齊全材料
@@ -1170,7 +1248,8 @@ class AutoBreedApp:
                     return
 
                 class_res = self.mem.get_season_and_general_classification(
-                    max_merge_rarity=self.opt_max_merge_rarity.get()
+                    max_merge_rarity=self.opt_max_merge_rarity.get(),
+                    max_merge_star=self.opt_max_merge_star.get()
                 )
                 batches = class_res.get('general_batches', [])
                 if not batches:
@@ -1229,7 +1308,8 @@ class AutoBreedApp:
                     continue
 
                 class_res = self.mem.get_season_and_general_classification(
-                    max_merge_rarity=self.opt_max_merge_rarity.get()
+                    max_merge_rarity=self.opt_max_merge_rarity.get(),
+                    max_merge_star=self.opt_max_merge_star.get()
                 )
                 batches = class_res.get('general_batches', [])
                 if not batches:

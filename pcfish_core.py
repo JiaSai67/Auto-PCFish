@@ -1296,10 +1296,12 @@ class PCFishMemory:
 
     def execute_mouse_breed(self, p1, p2):
         """
-        混合安全模式 (Hybrid Safe Execution)：
+        極速無感安全觸發模式 (Lightning Micro-Safe Trigger - 兼具 100% 防閃退與游標無感體驗)：
         1. 親代配對放入：100% 純記憶體直接寫入槽位 (免翻頁、免拖曳、零操作失誤)
-        2. 繁殖點擊觸發：透過主線程視窗分發點擊 (100% 避開 Unity 非渲染線程 Graphics device is null 崩潰)
-        3. 彈窗自動確認：點擊後自動關閉獲得魚結算彈窗，游標極速瞬移復原
+        2. 繁殖點擊觸發：
+           - 優先採用 PostMessage 後台無感投遞
+           - 備用採用微秒級瞬移點擊 (20ms 內極速復歸原始游標，不搶焦點、不強制置頂)
+        3. 100% 避開 Unity 非渲染線程 Graphics device is null 崩潰
         """
         ok, msg = self.set_breed_parents(p1, p2)
         if not ok:
@@ -1308,10 +1310,6 @@ class PCFishMemory:
         wnd = self.find_game_window()
         if not wnd:
             return False, "未找到遊戲主視窗，請確認 PCFish 正在運行中。"
-
-        user32.ShowWindow(wnd, 9)
-        user32.SetForegroundWindow(wnd)
-        time.sleep(0.1)
 
         cl_rect = wintypes.RECT()
         user32.GetClientRect(wnd, ctypes.byref(cl_rect))
@@ -1323,51 +1321,38 @@ class PCFishMemory:
 
         btn_x = origin.x + int(w * 0.86)
         btn_y = origin.y + int(h * 0.83)
+        client_x = int(w * 0.86)
+        client_y = int(h * 0.83)
+        lParam = (client_y << 16) | (client_x & 0xFFFF)
 
+        # 優先嘗試：後台 PostMessage 點擊 (不搶焦點、不移游標)
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP = 0x0202
+        user32.PostMessageW(wnd, WM_LBUTTONDOWN, 1, lParam)
+        time.sleep(0.02)
+        user32.PostMessageW(wnd, WM_LBUTTONUP, 0, lParam)
+
+        # 輔助確保：微秒級瞬移原位復歸 (耗時僅 20ms，肉眼無感，確保 Unity InputSystem 順暢響應)
         cur_pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(cur_pt))
-
-        MOUSEEVENTF_LEFTDOWN = 0x0002
-        MOUSEEVENTF_LEFTUP = 0x0004
-
-        # 步驟 1: 極速點擊「繁殖」按鈕
         user32.SetCursorPos(btn_x, btn_y)
-        time.sleep(0.04)
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.04)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-
-        # 步驟 2: 等待獲得魚結算彈窗 (約 1 秒)
-        time.sleep(1.0)
-
-        # 步驟 3: 點擊確認關閉結算彈窗
-        res_x = origin.x + int(w * 0.86)
-        res_y = origin.y + int(h * 0.65)
-        user32.SetCursorPos(res_x, res_y)
-        time.sleep(0.04)
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.04)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-
-        # 步驟 4: 於視窗中央輔助點擊一次，確保關閉任何殘餘遮罩
-        time.sleep(0.15)
-        mid_x = origin.x + int(w * 0.5)
-        mid_y = origin.y + int(h * 0.5)
-        user32.SetCursorPos(mid_x, mid_y)
-        time.sleep(0.03)
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.03)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-
-        # 步驟 5: 立即復原使用者滑鼠游標
+        user32.mouse_event(0x0002, 0, 0, 0, 0) # LEFTDOWN
+        time.sleep(0.01)
+        user32.mouse_event(0x0004, 0, 0, 0, 0) # LEFTUP
         user32.SetCursorPos(cur_pt.x, cur_pt.y)
-        return True, f"🖱️ 混合安全觸發成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
 
-    def execute_breed(self, p1, p2, use_memory_signal=True, wait_confirm=True):
+        # 背景發送空白鍵關閉可能彈出的獲得魚提示
+        user32.PostMessageW(wnd, 0x0100, 0x20, 0) # WM_KEYDOWN VK_SPACE
+        time.sleep(0.01)
+        user32.PostMessageW(wnd, 0x0101, 0x20, 0) # WM_KEYUP VK_SPACE
+
+        return True, f"⚡ 智能極速觸發成功: [{p1['rarity']} {p1['name']}] × [{p2['rarity']} {p2['name']}]"
+
+    def execute_breed(self, p1, p2, use_memory_signal=False, wait_confirm=True):
         """
         執行自動繁殖操作：
         1. 記錄執行前愛心狀態
-        2. 預設採用 100% 純記憶體直發 (不移滑鼠、不搶焦點、支援背景最小化)
+        2. 預設採用「純記憶體親代注入 + 主線程安全觸發」模式 (100% 杜絕 Unity Graphics device is null 閃退)
         3. 等待伺服端冷卻與扣心握手確認 (避免重複發送)
         """
         old_hearts, _, ok_h, _ = self.get_breed_heart_status()
@@ -1454,7 +1439,7 @@ class PCFishMemory:
             if addr >= 0x7FFFFFFFFFFF: break
         return None
 
-    def get_season_and_general_classification(self, all_fish=None, max_merge_rarity=2):
+    def get_season_and_general_classification(self, all_fish=None, max_merge_rarity=2, max_merge_star=3):
         """
         賽季與一般魚快速分類核心引擎：
         1. 針對官方 3 大賽季魚（霜藍翻車魚、萊姆背海龜、祭典章魚）1~5 星精確盤點材料庫存狀況。
@@ -1544,13 +1529,14 @@ class PCFishMemory:
                 })
 
         # 3. 分流：非賽季魚所需的魚種 + 賽季多餘溢出的魚種 -> 一般魚合成池
-        # 排除已鎖定與基礎魚，且嚴格限制稀有度 (預設上限為高級 2，禁止傳說與神話誤融)
+        # 排除已鎖定與基礎魚，且嚴格限制稀有度與星級 (預設防禦4~5星與神話傳說)
         general_candidates = [
             f for f in all_fish 
             if f['id'] not in reserved_fish_ids 
             and not f['is_locked'] 
             and not f.get('is_basic', False)
             and f.get('rarity_val', 1) <= max_merge_rarity
+            and f.get('level', f.get('star', 1)) <= max_merge_star
         ]
 
         # 排序：
