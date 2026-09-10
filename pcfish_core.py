@@ -1756,20 +1756,44 @@ class PCFishMemory:
         self.write_bytes(buf + 0x14, raw)
         return buf
 
+    def unlock_ui_touch_block(self):
+        """
+        確保全域 UI 輸入未被合成/網路等待狀態鎖定 (UIManager.isTouchBlock = 0):
+        防止動畫或網路延遲導致使用者點擊畫面或關閉按鈕無反應。
+        """
+        if not self.h_proc:
+            return
+        ga_base = self.get_module_base("GameAssembly.dll")
+        if not ga_base:
+            return
+        try:
+            # 鏈式解析 UIManager 實例: [[[[ga_base + 0x3722FC8] + 0x20] + 0xC0] + 0x08]
+            p1 = self.read_ptr(ga_base + 0x3722FC8)
+            if p1:
+                p2 = self.read_ptr(p1 + 0x20)
+                if p2:
+                    p3 = self.read_ptr(p2 + 0xC0)
+                    if p3:
+                        inst = self.read_ptr(p3 + 0x08)
+                        if inst and 0x10000 <= inst <= 0x7FFFFFFFFFFF:
+                            self.write_bytes(inst + 0x110, b'\x00')
+        except Exception:
+            pass
+
     def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
         """
         純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
-        1. 確保雙重旁路保護補丁生效 (Breed: 0x5f102b, Merge: 0x5f169b)
+        1. 確保三重旁路保護補丁生效 (Breed: 0x5f102b, SeasonCraft: 0x5f1369, Merge: 0x5f169b)
         2. 定位 UIMerge 物件
         3. 直接在記憶體中配置與重置槽位 (零調用非渲染線程 UI 方法，杜絕任何圖形崩潰)
         4. 將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
-        5. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與 fishType (+0xc0)
+        5. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與官方 fishType 原生實例 (+0xc0)
            若為一般融合 (merge_type == 0)，配置 mergeType=0, fishType=0, targetStar=1
-        6. 原生調用 UIMerge.Merge() 發送網路合成封包 (直接送往伺服端，不經任何 UI 彈窗攔截)
-        7. 等候 1.5 秒伺服端結算後，直接在記憶體中清理槽位
+        6. 原生調用 UIMerge.Merge() 發送核心合成封包
+        7. 伺服端完成後執行全域輸入解鎖與安全結算收尾，杜絕畫面卡死
         """
         with self._lock:
-            # 關鍵防護 1: 確保雙重旁路保護補丁生效 (Breed + Merge)
+            # 關鍵防護 1: 確保三重旁路保護補丁生效 (Breed + SeasonCraft + Merge)
             self.apply_safe_memory_patches()
 
             u = self.locate_uimerge()
@@ -1780,14 +1804,12 @@ class PCFishMemory:
                 return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
 
             k = self.read_ptr(u)
-            mi_update = self.get_class_method(k, "UpdateMergeCount")
             mi_merge = self.get_class_method(k, "Merge")
 
             if not mi_merge:
                 methods_ptr = self.read_ptr(k + 0x98)
                 if methods_ptr:
-                    mi_update = mi_update or self.read_ptr(methods_ptr + 8 * 8)
-                    mi_merge = mi_merge or self.read_ptr(methods_ptr + 14 * 8)
+                    mi_merge = self.read_ptr(methods_ptr + 14 * 8)
 
             if not mi_merge:
                 return False, "無法讀取 UIMerge.Merge 原生函式表指針"
@@ -1839,13 +1861,29 @@ class PCFishMemory:
             if not ok:
                 return False, f"合成發送失敗: {msg}"
 
-            # 4. 等候 1.5 秒伺服端完成後，在記憶體中清理槽位
-            time.sleep(1.5)
-            for idx in range(10):
-                self.write_ptr(p78 + 0x20 + idx * 8, 0)
-            self.write_ptr(u + 0xc0, 0)
-            self.write_i32(u + 0xb8, 0)
-            self.write_i32(u + 0xc8, 1)
+            # 4. 等候伺服端結算與動畫處理 (約 2.0 秒)
+            time.sleep(2.0)
+
+            # 5. 安全收尾防護：
+            # (a) 強制解除 UIManager.isTouchBlock 全域觸控鎖定，徹底杜絕畫面卡死無反應
+            self.unlock_ui_touch_block()
+
+            # (b) 若檢測到 UIFishResultFx 特效視窗處於等待狀態，觸發 FinishFx 安全收尾
+            fx = self.read_ptr(u + 0xA0)
+            if fx and 0x10000 <= fx <= 0x7FFFFFFFFFFF:
+                action_ptr = self.read_ptr(fx + 0x20)
+                if action_ptr and 0x10000 <= action_ptr <= 0x7FFFFFFFFFFF:
+                    mi_finish = self.get_class_method(self.read_ptr(fx), "FinishFx")
+                    if mi_finish:
+                        self.invoke_il2cpp_method(mi_finish, fx)
+                        time.sleep(0.5)
+                        self.unlock_ui_touch_block()
+
+            # (c) 安全重置 UIMerge 介面狀態 (呼叫 MergeInit 清理槽位與恢復預設)
+            mi_init = self.get_class_method(k, "MergeInit")
+            if mi_init:
+                self.invoke_il2cpp_method(mi_init, u)
+            self.unlock_ui_touch_block()
 
             type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
             return True, f"★ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"

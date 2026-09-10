@@ -1,5 +1,5 @@
 """
-PC Fish 智能繁殖與合成管理終端 v1.1.3 STABLE
+PC Fish 智能繁殖與合成管理終端 v1.1.4 STABLE
 - 依照 Impeccable (Operate Mode) 與 AI Tool Standard 規範全新重構
 - 100% 記憶體直讀 GameDataManager (愛心數量、倒數計時、魚隻列表)
 - 魚種冷卻時間全面導入本地 Windows 時間戳登記與平滑倒數
@@ -10,7 +10,7 @@ PC Fish 智能繁殖與合成管理終端 v1.1.3 STABLE
 - 嚴格導入官方數值底層最高期望值黃金階梯配對 (杜絕 3+2、2+1 降階污染)
 - 🌟 全新支援官方賽季魚 (FS00033 霜藍翻車魚、FS00034 萊姆背海龜、FS00035 祭典章魚) 1~5 星合成雷達
 - 🌟 賽季材料自動鎖定保護 (防挪用) + 非賽季/溢出魚分流一般魚融合池 (0次廢魚優先耗損)
-- 🌟 純記憶體原生直發合成/融合訊號 (三重旁路補丁 + 官方實例填入，杜絕彈窗與介面卡死)
+- 🌟 純記憶體原生直發合成/融合訊號 (三重旁路補丁 + 官方實例填入 + 觸控阻擋自動解除，徹底杜絕畫面定格卡死)
 - 🌟 自主設定星級上限與稀有度上限防護（預設 <=3 星、<=高級，保護高星高階魚種）
 """
 
@@ -36,7 +36,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.3 STABLE (純記憶體直發)")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.4 STABLE (純記憶體直發)")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -173,7 +173,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="v1.1.3 STABLE",
+            text="v1.1.4 STABLE",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
