@@ -215,9 +215,11 @@ class PCFishMemory:
         純記憶體模式防閃退核心保護補丁 (Unity Off-Thread Graphics Bypass):
         1. 繁殖保護 (NetworkManager.FishBreed, GameAssembly.dll + 0x5f102b):
            旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
-        2. 合成保護 (NetworkManager.FishMerge, GameAssembly.dll + 0x5f169b):
+        2. 賽季合成保護 (NetworkManager.FishSeasonCraft, GameAssembly.dll + 0x5f1369):
            旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
-        雙重補丁 100% 確保繁殖與合成在純記憶體模式下絕對穩定、零崩潰！
+        3. 一般融合保護 (NetworkManager.FishMerge, GameAssembly.dll + 0x5f169b):
+           旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
+        三重補丁 100% 確保繁殖、賽季合成與一般融合在純記憶體模式下絕對穩定、零崩潰！
         """
         if not self.h_proc:
             return False
@@ -227,6 +229,7 @@ class PCFishMemory:
 
         patches = [
             (0x5f102b, b'\xe8\xf0\xb4\x1a\x02', "FishBreed"),
+            (0x5f1369, b'\xe8\xb2\xb1\x1a\x02', "FishSeasonCraft"),
             (0x5f169b, b'\xe8\x80\xae\x1a\x02', "FishMerge"),
         ]
 
@@ -1801,6 +1804,7 @@ class PCFishMemory:
             self.write_i32(u + 0xb8, merge_type)
             if merge_type == 1:
                 self.write_i32(u + 0xc8, target_star)
+                fish_type_obj = 0
                 season_str_ptr = 0
                 gdm = self.locate_gamedata_manager()
                 if gdm:
@@ -1813,15 +1817,19 @@ class PCFishMemory:
                             k_ptr = self.read_ptr(e_addr + 8)
                             if self.read_utf16_str(k_ptr) == target_season_type:
                                 season_str_ptr = k_ptr
+                                fish_type_obj = self.read_ptr(e_addr + 16)
                                 break
-                if not season_str_ptr:
-                    season_str_ptr = self.create_managed_string(target_season_type)
 
-                if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
-                    self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
-                if self._season_dummy_obj and season_str_ptr:
-                    self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
-                    self.write_ptr(u + 0xc0, self._season_dummy_obj)
+                if fish_type_obj:
+                    self.write_ptr(u + 0xc0, fish_type_obj)
+                else:
+                    if not season_str_ptr:
+                        season_str_ptr = self.create_managed_string(target_season_type)
+                    if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
+                        self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
+                    if self._season_dummy_obj and season_str_ptr:
+                        self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
+                        self.write_ptr(u + 0xc0, self._season_dummy_obj)
             else:
                 self.write_ptr(u + 0xc0, 0)
                 self.write_i32(u + 0xc8, 1)
