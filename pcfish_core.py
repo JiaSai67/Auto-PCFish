@@ -230,10 +230,16 @@ class PCFishMemory:
             return False
 
         patches = [
-            (0x5f102b, b'\xe8\xf0\xb4\x1a\x02', "FishBreed SetActive"),
-            (0x5f1369, b'\xe8\xb2\xb1\x1a\x02', "FishSeasonCraft SetActive"),
-            (0x5f169b, b'\xe8\x80\xae\x1a\x02', "FishMerge SetActive"),
-            (0x5bd522, b'\xe8\xe9\x15\xf0\xff', "UIMerge.Merge SetActive"),
+            # 最新版 (2026/9/12+ 更新版)
+            (0x5FB28B, b'\xe8\xe0]\x1a\x02', "FishBreed SetActive"),
+            (0x5FB5C9, b'\xe8\xa2Z\x1a\x02', "FishCraft SetActive"),
+            (0x5FB8FB, b'\xe8pW\x1a\x02', "FishMerge SetActive"),
+            (0x5C9912, b'\xe8\xf9Q\xef\xff', "UIMerge.Merge SetActive"),
+            # 前代相容 (舊版二進位)
+            (0x5F102B, b'\xe8\xf0\xb4\x1a\x02', "FishBreed SetActive (legacy)"),
+            (0x5F1369, b'\xe8\xb2\xb1\x1a\x02', "FishCraft SetActive (legacy)"),
+            (0x5F169B, b'\xe8\x80\xae\x1a\x02', "FishMerge SetActive (legacy)"),
+            (0x5BD522, b'\xe8\xe9\x15\xf0\xff', "UIMerge.Merge SetActive (legacy)"),
         ]
 
         all_ok = True
@@ -253,8 +259,6 @@ class PCFishMemory:
                     kernel32.FlushInstructionCache(self.h_proc, ctypes.c_void_p(target_addr), 5)
                 else:
                     all_ok = False
-            else:
-                all_ok = False
         return all_ok
 
     def apply_safe_memory_breed_patch(self):
@@ -757,7 +761,9 @@ class PCFishMemory:
                         block = self.read_bytes(f_addr + 0x10, 0x40)
                         if len(block) < 0x40: continue
                         id_ptr, fish_ptr = struct.unpack('<QQ', block[0x00:0x10])
-                        level, grade, growth, breed, breed_max, flags = struct.unpack('<iiiiii', block[0x18:0x30])
+                        grade, level, growth, breed, breed_max = struct.unpack('<iiiii', block[0x18:0x2C])
+                        is_placed = bool(self.read_bytes(f_addr + 0x3C, 1)[0])
+                        is_locked = bool(self.read_bytes(f_addr + 0x3D, 1)[0])
                         p_next_dt = struct.unpack('<Q', block[0x38:0x40])[0]
 
                         id_str = self.read_utf16_str(id_ptr)
@@ -775,7 +781,6 @@ class PCFishMemory:
                         cd_target = self.fish_cd_registry.get(id_str, next_ts)
                         is_basic = ("BF" in id_str) or ("BF" in fish_code)
                         can_breed = (breed > 0) or is_basic
-                        is_locked = bool(flags & 0x100)
                         is_cooldown = (cd_target > now_ts)
                         cd_remain = max(0, cd_target - now_ts) if is_cooldown else 0
 
@@ -801,6 +806,7 @@ class PCFishMemory:
                                 "breed_max": breed_max,
                                 "can_breed": can_breed,
                                 "is_basic": is_basic,
+                                "is_placed": is_placed,
                                 "is_locked": is_locked,
                                 "is_cooldown": is_cooldown,
                                 "cd_remain": cd_remain,
@@ -834,12 +840,13 @@ class PCFishMemory:
                         id_str = self.read_utf16_str(id_ptr)
                         fish_code = self.read_utf16_str(fish_ptr)
 
-                        level = self.read_i32(f_addr + 0x28)     # 星級 1~5
-                        grade = self.read_i32(f_addr + 0x2C)     # 稀有度 0~5
+                        grade = self.read_i32(f_addr + 0x28)     # 稀有度 0~5
+                        level = self.read_i32(f_addr + 0x2C)     # 星級 1~5
                         growth = self.read_i32(f_addr + 0x30)
                         breed = self.read_i32(f_addr + 0x34)
                         breed_max = self.read_i32(f_addr + 0x38)
-                        flags = self.read_i32(f_addr + 0x3C)
+                        is_placed = bool(self.read_bytes(f_addr + 0x3C, 1)[0])
+                        is_locked = bool(self.read_bytes(f_addr + 0x3D, 1)[0])
 
                         p_next_dt = self.read_ptr(f_addr + 0x48)
                         s_next_dt = self.read_utf16_str(p_next_dt)
@@ -857,7 +864,6 @@ class PCFishMemory:
 
                         is_basic = ("BF" in id_str) or ("BF" in fish_code)
                         can_breed = (breed > 0) or is_basic
-                        is_locked = bool(flags & 0x100)
                         is_cooldown = (next_ts > now_ts)
                         cd_remain = max(0, next_ts - now_ts) if is_cooldown else 0
 
@@ -883,6 +889,7 @@ class PCFishMemory:
                                 "breed_max": breed_max,
                                 "can_breed": can_breed,
                                 "is_basic": is_basic,
+                                "is_placed": is_placed,
                                 "is_locked": is_locked,
                                 "is_cooldown": is_cooldown,
                                 "cd_remain": cd_remain,
@@ -1666,17 +1673,26 @@ class PCFishMemory:
             and f.get('star', 1) <= max_merge_star
         ]
 
-        # 排序：
-        # 1. 剩餘繁殖次數由低到高 (0次廢魚優先融合，耗損多餘魚隻)
-        # 2. 星級由低到高
-        # 3. 稀有度
-        general_candidates.sort(key=lambda f: (f['breed'], f.get('star', 1), f.get('rarity_val', 0)))
+        # 關鍵防護：遊戲伺服端強制規定一般融合必須為「同星級 (Same Star)」魚隻！
+        # 若混合不同星級放入 10 隻素材，伺服端將拒絕處理。
+        # 因此一般魚依星級由低到高（1星 -> 2星 -> 3星...）分組打包。
+        # 同星級內部排序：
+        #   1. 剩餘繁殖次數由低到高 (0 次廢魚最優先耗損)
+        #   2. 稀有度由低到高 (普通魚優先)
+        #   3. 魚隻 ID
+        star_groups = {}
+        for f in general_candidates:
+            star = f.get('star', 1)
+            star_groups.setdefault(star, []).append(f)
 
-        # 10 隻為一組打包
         general_batches = []
-        for i in range(0, len(general_candidates) - (len(general_candidates) % 10), 10):
-            batch = general_candidates[i:i+10]
-            general_batches.append(batch)
+        for star in sorted(star_groups.keys()):
+            f_list = star_groups[star]
+            f_list.sort(key=lambda f: (f['breed'], f.get('rarity_val', 0), f['id']))
+            # 每 10 隻為一組打包
+            num_batches = len(f_list) // 10
+            for i in range(num_batches):
+                general_batches.append(f_list[i*10 : (i+1)*10])
 
         return {
             "total_fish": len(all_fish),
@@ -1760,9 +1776,31 @@ class PCFishMemory:
         self.write_bytes(buf + 0x14, raw)
         return buf
 
+    def locate_network_manager(self):
+        """動態解析並定位 NetworkManager 單例實例 (跨版本相容)"""
+        if not self.h_proc:
+            return 0
+        ga_base = self.get_module_base("GameAssembly.dll")
+        if not ga_base:
+            return 0
+        try:
+            # SingletonManager<NetworkManager> token @ ga_base + 0x3729780
+            p1 = self.read_ptr(ga_base + 0x3729780)
+            if p1:
+                p2 = self.read_ptr(p1 + 0x20)
+                if p2:
+                    p3 = self.read_ptr(p2 + 0xB8)
+                    if p3:
+                        inst = self.read_ptr(p3)
+                        if inst and 0x10000 <= inst <= 0x7FFFFFFFFFFF:
+                            return inst
+        except Exception:
+            pass
+        return 0
+
     def unlock_ui_touch_block(self):
         """
-        確保全域 UI 輸入未被合成/網路等待狀態鎖定 (UIManager.isTouchBlock = 0):
+        確保全域 UI 輸入未被合成/網路等待狀態鎖定 (UIManager.isProcessing = 0):
         防止動畫或網路延遲導致使用者點擊畫面或關閉按鈕無反應。
         """
         if not self.h_proc:
@@ -1771,93 +1809,218 @@ class PCFishMemory:
         if not ga_base:
             return
         try:
-            # 鏈式解析 UIManager 實例: [[[[ga_base + 0x3722FC8] + 0x20] + 0xC0] + 0x08]
-            p1 = self.read_ptr(ga_base + 0x3722FC8)
+            # 鏈式解析 UIManager 實例: [[[[ga_base + 0x3729988] + 0x20] + 0xB8]]
+            p1 = self.read_ptr(ga_base + 0x3729988)
             if p1:
                 p2 = self.read_ptr(p1 + 0x20)
                 if p2:
-                    p3 = self.read_ptr(p2 + 0xC0)
+                    p3 = self.read_ptr(p2 + 0xB8)
                     if p3:
-                        inst = self.read_ptr(p3 + 0x08)
+                        inst = self.read_ptr(p3)
                         if inst and 0x10000 <= inst <= 0x7FFFFFFFFFFF:
                             self.write_bytes(inst + 0x110, b'\x00')
+                            return
+            # 舊版相容備用路徑
+            p1_old = self.read_ptr(ga_base + 0x3722FC8)
+            if p1_old:
+                p2_old = self.read_ptr(p1_old + 0x20)
+                if p2_old:
+                    p3_old = self.read_ptr(p2_old + 0xC0)
+                    if p3_old:
+                        inst_old = self.read_ptr(p3_old + 0x08)
+                        if inst_old and 0x10000 <= inst_old <= 0x7FFFFFFFFFFF:
+                            self.write_bytes(inst_old + 0x110, b'\x00')
         except Exception:
             pass
 
     def execute_pure_signal_merge(self, fish_list_10, merge_type=0, target_season_type="", target_star=1):
         """
         純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
-        1. 確保三重旁路保護補丁生效 (Breed: 0x5f102b, SeasonCraft: 0x5f1369, Merge: 0x5f169b)
-        2. 定位 UIMerge 物件
-        3. 將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
-        4. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與合法託管 FishTypeModel 實例 (+0xc0)
-           若為一般融合 (merge_type == 0)，配置 mergeType=0, fishType=0, targetStar=1
-        5. 原生調用 UIMerge.Merge() 發送核心合成封包
-        6. 動態輪詢伺服端扣除材料握手確認 (3.5秒內即時驗證庫存是否真正消耗)
-        7. 結算完成後自動解除觸控鎖定與結算特效，徹底杜絕畫面卡死
+        1. 確保防閃退保護補丁生效 (NOP 載入指示器 SetActive，杜絕非渲染線程崩潰)
+        2. 動態定位 NetworkManager 單例實例 (零依賴 UI 介面，零 NullReference 崩潰風險)
+        3. 調用 il2cpp_array_new(System.String[], 10) 構建完全託管的材料 GUID 陣列 (杜絕越界與記憶體覆寫)
+        4. 若為賽季合成 (merge_type == 1)，原生調用 NetworkManager.FishCraft(nm_inst, season_type_str, target_star, id_arr)
+           若為一般融合 (merge_type == 0)，原生調用 NetworkManager.FishMerge(nm_inst, id_arr)
+        5. 動態輪詢伺服端扣除材料握手確認 (最多等待 4 秒，即時驗證背包消耗)
+        6. 解除全域 UI 輸入鎖定 (UIManager.isProcessing = 0)
         """
         with self._lock:
-            # 關鍵防護 1: 確保三重旁路保護補丁生效 (Breed + SeasonCraft + Merge)
+            # 關鍵防護 1: 確保安全防閃退補丁全面生效
             self.apply_safe_memory_patches()
-
-            u = self.locate_uimerge()
-            if not u:
-                return False, "無法定位遊戲 UIMerge 實例 (請先在遊戲中打開「合成」介面)"
 
             if len(fish_list_10) != 10:
                 return False, f"合成操作必須精確放入 10 隻魚 (當前為 {len(fish_list_10)} 隻)"
 
-            k = self.read_ptr(u)
-            mi_merge = self.get_class_method(k, "Merge")
+            ga_base = self.get_module_base("GameAssembly.dll")
+            if not ga_base:
+                return False, "無法取得 GameAssembly.dll 基址"
 
-            if not mi_merge:
-                methods_ptr = self.read_ptr(k + 0x98)
-                if methods_ptr:
-                    mi_merge = self.read_ptr(methods_ptr + 14 * 8)
+            nm_inst = self.locate_network_manager()
+            if not nm_inst:
+                return False, "無法定位 NetworkManager 單例實例"
 
-            if not mi_merge:
-                return False, "無法讀取 UIMerge.Merge 原生函式表指針"
+            exps = self.get_il2cpp_exports()
+            if not exps or 'il2cpp_domain_get' not in exps or 'il2cpp_thread_attach' not in exps:
+                return False, "無法取得 IL2CPP 核心導出函式"
 
-            # 1. 直接向 mergeFishList (u + 0x78, String[10]) 寫入 10 個材料魚之合法字串指標
-            p78 = self.read_ptr(u + 0x78)
-            if not p78 or not (0x10000 <= p78 <= 0x7FFFFFFFFFFF):
-                return False, "無法獲取 mergeFishList 記憶體陣列"
-
-            for idx, f in enumerate(fish_list_10):
-                self.write_ptr(p78 + 0x20 + idx * 8, f['idPtr'])
-
-            # 2. 設置合成型態 (賽季合成 vs 一般融合)
-            self.write_i32(u + 0xb8, merge_type)
-            if merge_type == 1:
-                self.write_i32(u + 0xc8, target_star)
-                season_str_ptr = self.create_managed_string(target_season_type)
-                
-                # 取得或創建合法的 FishTypeModel 物件
-                cur_ft_obj = self.read_ptr(u + 0xc0)
-                if cur_ft_obj and 0x10000 <= cur_ft_obj <= 0x7FFFFFFFFFFF:
-                    self.write_ptr(cur_ft_obj + 0x10, season_str_ptr)
-                else:
-                    if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
-                        self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
-                    if self._season_dummy_obj:
-                        if getattr(self, '_string_klass', 0):
-                            self.write_ptr(self._season_dummy_obj, self._string_klass)
-                        self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
-                        self.write_ptr(u + 0xc0, self._season_dummy_obj)
-            else:
-                self.write_ptr(u + 0xc0, 0)
-                self.write_i32(u + 0xc8, 1)
+            fn_domain_get = exps['il2cpp_domain_get']
+            fn_thread_attach = exps['il2cpp_thread_attach']
+            fn_array_new = ga_base + 0x3F7030 # il2cpp_array_new
+            k_str_arr = self.read_ptr(ga_base + 0x3710AD8) # System.String[] class
+            if not k_str_arr:
+                return False, "無法取得 System.String[] 類別指標"
 
             mat_ids = {f['id'] for f in fish_list_10}
 
-            # 3. 原生調用 Merge 發送核心合成訊號 (直接送出網路封包，零 UI 阻擋)
-            ok, msg = self.invoke_il2cpp_method(mi_merge, u)
-            if not ok:
-                return False, f"合成訊號發送失敗: {msg}"
+            if merge_type == 1:
+                # 賽季合成 (NetworkManager.FishCraft, RVA: 0x5fb320)
+                fn_craft = ga_base + 0x5FB320
+                season_str_ptr = self.create_managed_string(target_season_type)
+                if not season_str_ptr:
+                    return False, f"建立賽季字串 {target_season_type} 失敗"
 
-            # 4. 動態輪詢伺服端扣除材料握手確認 (最多等待 3.5 秒)
+                # param_mem layout:
+                #   +0x00: fn_domain_get
+                #   +0x08: fn_thread_attach
+                #   +0x10: fn_array_new
+                #   +0x18: k_str_arr
+                #   +0x20: fn_craft
+                #   +0x28: nm_inst
+                #   +0x30: season_str_ptr
+                #   +0x38: target_star
+                #   +0x40..+0x88: 10 idPtrs
+                param_mem = kernel32.VirtualAllocEx(self.h_proc, None, 0x120, 0x3000, 0x04)
+                self.write_ptr(param_mem + 0x00, fn_domain_get)
+                self.write_ptr(param_mem + 0x08, fn_thread_attach)
+                self.write_ptr(param_mem + 0x10, fn_array_new)
+                self.write_ptr(param_mem + 0x18, k_str_arr)
+                self.write_ptr(param_mem + 0x20, fn_craft)
+                self.write_ptr(param_mem + 0x28, nm_inst)
+                self.write_ptr(param_mem + 0x30, season_str_ptr)
+                self.write_i32(param_mem + 0x38, target_star)
+                for i, f in enumerate(fish_list_10):
+                    self.write_ptr(param_mem + 0x40 + i * 8, f['idPtr'])
+
+                # 組合 16 位元組對齊之 x64 Shellcode
+                sc = bytearray()
+                sc.extend(b'\x55\x53\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57') # push 8 regs (64 bytes)
+                sc.extend(b'\x48\x83\xEC\x38')                                 # sub rsp, 0x38 (56 bytes, rsp % 16 == 0)
+                sc.extend(b'\x48\x89\xCB')                                     # mov rbx, rcx
+
+                # domain = il2cpp_domain_get()
+                sc.extend(b'\xFF\x13')                                         # call qword ptr [rbx]
+                # thread_attach(domain)
+                sc.extend(b'\x48\x89\xC1')                                     # mov rcx, rax
+                sc.extend(b'\xFF\x53\x08')                                     # call qword ptr [rbx + 0x08]
+
+                # arr = il2cpp_array_new(k_str_arr, 10)
+                sc.extend(b'\x48\x8B\x4B\x18')                                 # mov rcx, [rbx + 0x18]
+                sc.extend(b'\xBA\x0A\x00\x00\x00')                             # mov edx, 10
+                sc.extend(b'\xFF\x53\x10')                                     # call qword ptr [rbx + 0x10]
+                sc.extend(b'\x49\x89\xC7')                                     # mov r15, rax
+
+                # copy 10 idPtrs into array
+                sc.extend(b'\x31\xC9')                                         # xor ecx, ecx
+                # loop start:
+                sc.extend(b'\x48\x8B\x54\xCB\x40')                             # mov rdx, [rbx + rcx*8 + 0x40]
+                sc.extend(b'\x49\x89\x54\xCF\x20')                             # mov [r15 + rcx*8 + 0x20], rdx
+                sc.extend(b'\x48\xFF\xC1')                                     # inc rcx
+                sc.extend(b'\x48\x83\xF9\x0A')                                 # cmp rcx, 10
+                sc.extend(b'\x7C\xED')                                         # jl loop_start
+
+                # call FishCraft(rcx = nm_inst, rdx = season_str, r8d = star, r9 = r15, [rsp+0x20]=0, [rsp+0x28]=0)
+                sc.extend(b'\x48\x8B\x4B\x28')                                 # mov rcx, [rbx + 0x28] (nm_inst)
+                sc.extend(b'\x48\x8B\x53\x30')                                 # mov rdx, [rbx + 0x30] (season_str_ptr)
+                sc.extend(b'\x44\x8B\x43\x38')                                 # mov r8d, [rbx + 0x38] (target_star)
+                sc.extend(b'\x4D\x89\xF9')                                     # mov r9, r15 (String[10] array)
+                sc.extend(b'\x48\xC7\x44\x24\x20\x00\x00\x00\x00')             # mov qword ptr [rsp + 0x20], 0
+                sc.extend(b'\x48\xC7\x44\x24\x28\x00\x00\x00\x00')             # mov qword ptr [rsp + 0x28], 0
+                sc.extend(b'\xFF\x53\x20')                                     # call qword ptr [rbx + 0x20] (FishCraft)
+
+                sc.extend(b'\x48\x83\xC4\x38')                                 # add rsp, 0x38
+                sc.extend(b'\x41\x5F\x41\x5E\x41\x5D\x41\x5C\x5F\x5E\x5B\x5D') # pop 8 regs
+                sc.extend(b'\xC3')                                             # ret
+
+            else:
+                # 一般魚融合 (NetworkManager.FishMerge, RVA: 0x5fb660)
+                fn_merge = ga_base + 0x5FB660
+
+                # param_mem layout:
+                #   +0x00: fn_domain_get
+                #   +0x08: fn_thread_attach
+                #   +0x10: fn_array_new
+                #   +0x18: k_str_arr
+                #   +0x20: fn_merge
+                #   +0x28: nm_inst
+                #   +0x30..+0x78: 10 idPtrs
+                param_mem = kernel32.VirtualAllocEx(self.h_proc, None, 0x100, 0x3000, 0x04)
+                self.write_ptr(param_mem + 0x00, fn_domain_get)
+                self.write_ptr(param_mem + 0x08, fn_thread_attach)
+                self.write_ptr(param_mem + 0x10, fn_array_new)
+                self.write_ptr(param_mem + 0x18, k_str_arr)
+                self.write_ptr(param_mem + 0x20, fn_merge)
+                self.write_ptr(param_mem + 0x28, nm_inst)
+                for i, f in enumerate(fish_list_10):
+                    self.write_ptr(param_mem + 0x30 + i * 8, f['idPtr'])
+
+                # 組合 16 位元組對齊之 x64 Shellcode
+                sc = bytearray()
+                sc.extend(b'\x55\x53\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57') # push 8 regs (64 bytes)
+                sc.extend(b'\x48\x83\xEC\x38')                                 # sub rsp, 0x38 (56 bytes, rsp % 16 == 0)
+                sc.extend(b'\x48\x89\xCB')                                     # mov rbx, rcx
+
+                # domain = il2cpp_domain_get()
+                sc.extend(b'\xFF\x13')                                         # call qword ptr [rbx]
+                # thread_attach(domain)
+                sc.extend(b'\x48\x89\xC1')                                     # mov rcx, rax
+                sc.extend(b'\xFF\x53\x08')                                     # call qword ptr [rbx + 0x08]
+
+                # arr = il2cpp_array_new(k_str_arr, 10)
+                sc.extend(b'\x48\x8B\x4B\x18')                                 # mov rcx, [rbx + 0x18]
+                sc.extend(b'\xBA\x0A\x00\x00\x00')                             # mov edx, 10
+                sc.extend(b'\xFF\x53\x10')                                     # call qword ptr [rbx + 0x10]
+                sc.extend(b'\x49\x89\xC7')                                     # mov r15, rax
+
+                # copy 10 idPtrs
+                sc.extend(b'\x31\xC9')                                         # xor ecx, ecx
+                # loop start:
+                sc.extend(b'\x48\x8B\x54\xCB\x30')                             # mov rdx, [rbx + rcx*8 + 0x30]
+                sc.extend(b'\x49\x89\x54\xCF\x20')                             # mov [r15 + rcx*8 + 0x20], rdx
+                sc.extend(b'\x48\xFF\xC1')                                     # inc rcx
+                sc.extend(b'\x48\x83\xF9\x0A')                                 # cmp rcx, 10
+                sc.extend(b'\x7C\xED')                                         # jl loop_start
+
+                # call FishMerge(rcx = nm_inst, rdx = r15, r8 = 0, r9 = 0, [rsp+0x20]=0, [rsp+0x28]=0)
+                sc.extend(b'\x48\x8B\x4B\x28')                                 # mov rcx, [rbx + 0x28] (nm_inst)
+                sc.extend(b'\x4C\x89\xFA')                                     # mov rdx, r15 (string array)
+                sc.extend(b'\x4D\x31\xC0')                                     # xor r8, r8 (callback = NULL)
+                sc.extend(b'\x4D\x31\xC9')                                     # xor r9, r9 (mi = NULL)
+                sc.extend(b'\x48\xC7\x44\x24\x20\x00\x00\x00\x00')             # mov qword ptr [rsp + 0x20], 0
+                sc.extend(b'\x48\xC7\x44\x24\x28\x00\x00\x00\x00')             # mov qword ptr [rsp + 0x28], 0
+                sc.extend(b'\xFF\x53\x20')                                     # call qword ptr [rbx + 0x20] (FishMerge)
+
+                sc.extend(b'\x48\x83\xC4\x38')                                 # add rsp, 0x38
+                sc.extend(b'\x41\x5F\x41\x5E\x41\x5D\x41\x5C\x5F\x5E\x5B\x5D') # pop 8 regs
+                sc.extend(b'\xC3')                                             # ret
+
+            code_mem = kernel32.VirtualAllocEx(self.h_proc, None, len(sc), 0x3000, 0x40)
+            written = ctypes.c_size_t()
+            kernel32.WriteProcessMemory(self.h_proc, ctypes.c_void_p(code_mem), bytes(sc), len(sc), ctypes.byref(written))
+
+            h_th = kernel32.CreateRemoteThread(self.h_proc, None, 0, ctypes.c_void_p(code_mem), ctypes.c_void_p(param_mem), 0, None)
+            if not h_th:
+                kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_mem), 0, 0x8000)
+                kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
+                return False, "建立遠程記憶體執行緒失敗"
+
+            kernel32.WaitForSingleObject(h_th, 5000)
+            kernel32.CloseHandle(h_th)
+            kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_mem), 0, 0x8000)
+            kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
+
+            # 動態輪詢伺服端扣除材料握手確認 (最多等待 4.0 秒)
             server_confirmed = False
-            for _ in range(7):
+            for _ in range(8):
                 time.sleep(0.5)
                 cur_all = self.get_all_fish()
                 cur_ids = {f['id'] for f in cur_all}
@@ -1866,25 +2029,13 @@ class PCFishMemory:
                     server_confirmed = True
                     break
 
-            # 5. 安全收尾防護：
-            # (a) 強制解除 UIManager.isTouchBlock 全域觸控鎖定，徹底杜絕畫面卡死無反應
+            # 安全收尾防護：強制解除 UIManager 全域輸入鎖定，徹底杜絕畫面無響應
             self.unlock_ui_touch_block()
-
-            # (b) 若檢測到 UIFishResultFx 特效視窗處於等待狀態，觸發 FinishFx 安全收尾
-            fx = self.read_ptr(u + 0xA0)
-            if fx and 0x10000 <= fx <= 0x7FFFFFFFFFFF:
-                action_ptr = self.read_ptr(fx + 0x20)
-                if action_ptr and 0x10000 <= action_ptr <= 0x7FFFFFFFFFFF:
-                    mi_finish = self.get_class_method(self.read_ptr(fx), "FinishFx")
-                    if mi_finish:
-                        self.invoke_il2cpp_method(mi_finish, fx)
-                        time.sleep(0.3)
-                        self.unlock_ui_touch_block()
 
             type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
             if not server_confirmed:
-                return False, f"⚠️ 已發送合成訊號，但伺服端尚未扣除材料 (可能配方材料不符或伺服器延遲)，請稍後再試"
+                return False, f"⚠️ 已發送合成訊號，但伺服端尚未在時限內扣除材料 (可能材料不符或網路延遲)，請稍後再試"
 
-            return True, f"★ 純記憶體合成成功: {type_desc} (伺服端已成功扣除 10 隻素材魚並發放產物)"
+            return True, f"★ 純記憶體直發合成成功: {type_desc} (伺服端已成功扣除 10 隻素材魚並發放產物)"
 
 
