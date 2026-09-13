@@ -765,7 +765,7 @@ class PCFishMemory:
                         block = self.read_bytes(f_addr + 0x10, 0x40)
                         if len(block) < 0x40: continue
                         id_ptr, fish_ptr = struct.unpack('<QQ', block[0x00:0x10])
-                        grade, level, growth, breed, breed_max = struct.unpack('<iiiii', block[0x18:0x2C])
+                        raw_star, raw_rarity, growth, breed, breed_max = struct.unpack('<iiiii', block[0x18:0x2C])
                         is_placed = bool(block[0x2C])
                         is_locked = bool(block[0x2D])
                         p_next_dt = struct.unpack('<Q', block[0x38:0x40])[0]
@@ -788,10 +788,22 @@ class PCFishMemory:
                         is_cooldown = (cd_target > now_ts)
                         cd_remain = max(0, cd_target - now_ts) if is_cooldown else 0
 
-                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= grade <= 10):
+                        # 雙重錨定：優先從官方魚隻代碼 (FSxxxxx_RR_SS_OO) 解析真實稀有度(RR)與星級(SS)，杜絕記憶體偏移顛倒
+                        star = raw_star
+                        rarity_val = raw_rarity
+                        if not is_basic and fish_code:
+                            parts = fish_code.split('_')
+                            if len(parts) >= 3:
+                                try:
+                                    rarity_val = int(parts[1]) # 稀有度: 0=基礎, 1=普通, 2=高級, 3=稀有, 4=傳說, 5=神話
+                                    star = int(parts[2])       # 星級: 1~5 星
+                                except:
+                                    pass
+
+                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= rarity_val <= 10):
                             disp_name = get_fish_display_name(fish_code, id_str)
-                            rarity_name = RARITY_MAP.get(grade, f"等級{grade}")
-                            stars_icon = "★" * max(1, level) if not is_basic else "-"
+                            rarity_name = RARITY_MAP.get(rarity_val, f"等級{rarity_val}")
+                            stars_icon = "★" * max(1, star) if not is_basic else "-"
 
                             fish_list.append({
                                 "ptr": f_addr,
@@ -800,10 +812,10 @@ class PCFishMemory:
                                 "fish": fish_code,
                                 "name": disp_name,
                                 "rarity": rarity_name,
-                                "rarity_val": grade,
-                                "grade": grade,
-                                "level": level,
-                                "star": level,
+                                "rarity_val": rarity_val,
+                                "grade": rarity_val,
+                                "level": star,
+                                "star": star,
                                 "stars": stars_icon,
                                 "growth": growth,
                                 "breed": breed,
@@ -844,8 +856,8 @@ class PCFishMemory:
                         id_str = self.read_utf16_str(id_ptr)
                         fish_code = self.read_utf16_str(fish_ptr)
 
-                        grade = self.read_i32(f_addr + 0x28)     # 稀有度 0~5
-                        level = self.read_i32(f_addr + 0x2C)     # 星級 1~5
+                        raw_star = self.read_i32(f_addr + 0x28)       # 星級 1~5
+                        raw_rarity = self.read_i32(f_addr + 0x2C)     # 稀有度 0~5
                         growth = self.read_i32(f_addr + 0x30)
                         breed = self.read_i32(f_addr + 0x34)
                         breed_max = self.read_i32(f_addr + 0x38)
@@ -871,10 +883,22 @@ class PCFishMemory:
                         is_cooldown = (next_ts > now_ts)
                         cd_remain = max(0, next_ts - now_ts) if is_cooldown else 0
 
-                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= grade <= 10):
+                        # 雙重錨定：優先從官方魚隻代碼解析真實稀有度與星級
+                        star = raw_star
+                        rarity_val = raw_rarity
+                        if not is_basic and fish_code:
+                            parts = fish_code.split('_')
+                            if len(parts) >= 3:
+                                try:
+                                    rarity_val = int(parts[1])
+                                    star = int(parts[2])
+                                except:
+                                    pass
+
+                        if id_str and (fish_code.startswith("FS") or fish_code.startswith("BF")) and (0 <= rarity_val <= 10):
                             disp_name = get_fish_display_name(fish_code, id_str)
-                            rarity_name = RARITY_MAP.get(grade, f"等級{grade}")
-                            stars_icon = "★" * max(1, level) if not is_basic else "-"
+                            rarity_name = RARITY_MAP.get(rarity_val, f"等級{rarity_val}")
+                            stars_icon = "★" * max(1, star) if not is_basic else "-"
 
                             fish_list.append({
                                 "ptr": f_addr,
@@ -883,10 +907,10 @@ class PCFishMemory:
                                 "fish": fish_code,
                                 "name": disp_name,
                                 "rarity": rarity_name,
-                                "rarity_val": grade,
-                                "grade": grade,
-                                "level": level,
-                                "star": level,
+                                "rarity_val": rarity_val,
+                                "grade": rarity_val,
+                                "level": star,
+                                "star": star,
                                 "stars": stars_icon,
                                 "growth": growth,
                                 "breed": breed,
