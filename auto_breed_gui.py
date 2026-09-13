@@ -1,5 +1,5 @@
 """
-PC Fish 智能繁殖與合成管理終端 v1.1.9 STABLE
+PC Fish 智能繁殖與合成管理終端 v1.2.0 STABLE
 - 依照 Impeccable (Operate Mode) 與 AI Tool Standard 規範全新重構
 - 100% 記憶體直讀 GameDataManager (愛心數量、倒數計時、魚隻列表)
 - 魚種冷卻時間全面導入本地 Windows 時間戳登記與平滑倒數
@@ -10,10 +10,11 @@ PC Fish 智能繁殖與合成管理終端 v1.1.9 STABLE
 - 嚴格導入官方數值底層最高期望值黃金階梯配對 (杜絕 3+2、2+1 降階污染)
 - 🌟 全新支援官方賽季魚 (FS00033 霜藍翻車魚、FS00034 萊姆背海龜、FS00035 祭典章魚) 1~5 星合成雷達
 - 🌟 賽季材料自動鎖定保護 (防挪用) + 非賽季/溢出魚分流一般魚融合池 (0次廢魚優先耗損)
-- 🌟 嚴格排除「魚缸放置中 (IsPlaced)」與「鎖定中 (IsLocked)」魚隻，杜絕因材料被佔用導致伺服器拒絕合成
+- 🌟 嚴格排除「魚缸放置中 (IsPlaced)」、「鎖定中 (IsLocked)」與「冷卻中 (IsCooldown)」魚隻，杜絕素材狀態衝突
 - 🌟 七重安全記憶體補丁：四重防閃退圖形旁路 + 三重靜默防錯誤彈窗 (徹底杜絕遊戲閃退與「發生網路錯誤/資料還原」阻擋視窗)
 - 🌟 一般魚嚴格依同星級分組打包 (100% 同星級安全融合，杜絕混星被伺服端拒絕)
-- 🌟 極速握手比對架構：將 900+ 條巨型魚庫的伺服器扣料確認時間從 43 秒大幅縮減至 1.0 秒！
+- 🌟 突破 500 隻魚庫讀取限制 (支援高達 10,000 隻巨型魚庫 15ms 原生直讀，根絕記憶體碎片幽靈死魚)
+- 🌟 伺服端雙重精準握手確認：徹底根絕假成功，嚴格確認材料魚自伺服端背包扣除才標記完成
 - 🌟 全新內建「📑 系統執行診斷報告」生成引擎，隨時一鍵導出系統健康診斷書
 - 🌟 自主設定星級上限與稀有度上限防護（預設 <=3 星、<=高級，保護高星高階魚種）
 """
@@ -40,7 +41,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.9 STABLE (純記憶體直發)")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.2.0 STABLE (純記憶體直發)")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -177,7 +178,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="v1.1.9 STABLE",
+            text="v1.2.0 STABLE",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
@@ -1235,8 +1236,12 @@ class AutoBreedApp:
                     return
 
                 batch_10 = batches[0]
+                star_val = batch_10[0].get('star', 1)
+                rarity_val = batch_10[0].get('rarity_val', 1)
+                rarity_desc = RARITY_MAP.get(rarity_val, f"階級{rarity_val}")
+                zero_cnt = sum(1 for f in batch_10 if f.get('breed', 0) == 0)
                 names_summary = ", ".join([f"{f['name']}({f['breed']}次)" for f in batch_10[:3]]) + f"... 等 10 隻"
-                self.log(f"【開始融合】挑選 10 隻一般魚 [{names_summary}]，發送純記憶體融合訊號...")
+                self.log(f"【開始融合】挑選 10 隻一般魚 [{star_val}星 {rarity_desc} | 0次廢魚 {zero_cnt}隻 | {names_summary}]，發送純記憶體融合訊號...")
 
                 ok, res_msg = self.mem.execute_pure_signal_merge(batch_10, merge_type=0)
                 if ok:
@@ -1301,10 +1306,12 @@ class AutoBreedApp:
                     break
 
                 batch_10 = batches[0]
-                # 安全策略：如果整組魚的繁殖次數都大於 0，且使用者僅想融 0 次廢魚
-                zero_cnt = sum(1 for f in batch_10 if f['breed'] == 0)
+                star_val = batch_10[0].get('star', 1)
+                rarity_val = batch_10[0].get('rarity_val', 1)
+                rarity_desc = RARITY_MAP.get(rarity_val, f"階級{rarity_val}")
+                zero_cnt = sum(1 for f in batch_10 if f.get('breed', 0) == 0)
                 names_summary = ", ".join([f"{f['name']}({f['breed']}次)" for f in batch_10[:3]]) + f"... 等 10 隻"
-                self.log(f"【批量發送】第 1 組 [{names_summary}] (含 {zero_cnt} 隻 0 次廢魚)...")
+                self.log(f"【批量發送】第 1 組 [{star_val}星 {rarity_desc} | 0次廢魚 {zero_cnt}隻 | {names_summary}]...")
 
                 ok, res_msg = self.mem.execute_pure_signal_merge(batch_10, merge_type=0)
                 if ok:

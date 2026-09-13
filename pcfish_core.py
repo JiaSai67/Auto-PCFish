@@ -756,7 +756,7 @@ class PCFishMemory:
             if l_ptr:
                 items_arr = self.read_ptr(l_ptr + 0x10)
                 count = self.read_i32(l_ptr + 0x18)
-                if items_arr and 0 < count < 500:
+                if items_arr and 0 < count < 10000:
                     item_bytes = self.read_bytes(items_arr + 0x20, count * 8)
                     ptrs = struct.unpack(f'<{count}Q', item_bytes)
                     fish_list = []
@@ -766,8 +766,8 @@ class PCFishMemory:
                         if len(block) < 0x40: continue
                         id_ptr, fish_ptr = struct.unpack('<QQ', block[0x00:0x10])
                         grade, level, growth, breed, breed_max = struct.unpack('<iiiii', block[0x18:0x2C])
-                        is_placed = bool(self.read_bytes(f_addr + 0x3C, 1)[0])
-                        is_locked = bool(self.read_bytes(f_addr + 0x3D, 1)[0])
+                        is_placed = bool(block[0x2C])
+                        is_locked = bool(block[0x2D])
                         p_next_dt = struct.unpack('<Q', block[0x38:0x40])[0]
 
                         id_str = self.read_utf16_str(id_ptr)
@@ -1629,7 +1629,7 @@ class PCFishMemory:
                     m_amt = req['amount']
                     m_name = FISH_NAMES.get(m_type, m_type)
 
-                    avail = [f for f in inv_pool.get((m_type, m_star), []) if f['id'] not in allocated_ids and not f['is_locked'] and not f.get('is_placed', False)]
+                    avail = [f for f in inv_pool.get((m_type, m_star), []) if f['id'] not in allocated_ids and not f['is_locked'] and not f.get('is_placed', False) and not f.get('is_cooldown', False)]
                     taken = avail[:m_amt]
                     matched_count += len(taken)
                     selected_for_recipe.extend(taken)
@@ -1667,13 +1667,14 @@ class PCFishMemory:
                 })
 
         # 3. 分流：非賽季魚所需的魚種 + 賽季多餘溢出的魚種 -> 一般魚合成池
-        # 排除已鎖定、已放置魚缸與基礎魚，且嚴格限制稀有度與星級 (預設上限為高級 2、星級 <= 3，自主保護高星高階魚隻)
+        # 排除已鎖定、已放置魚缸、冷卻中與基礎魚，且嚴格限制稀有度與星級 (預設上限為高級 2、星級 <= 3，自主保護高星高階魚隻)
         general_candidates = [
             f for f in all_fish 
             if f['id'] not in reserved_fish_ids 
             and not f['is_locked'] 
             and not f.get('is_placed', False)
             and not f.get('is_basic', False)
+            and not f.get('is_cooldown', False)
             and f.get('rarity_val', 1) <= max_merge_rarity
             and f.get('star', 1) <= max_merge_star
         ]
@@ -1904,7 +1905,10 @@ class PCFishMemory:
                 self.write_ptr(param_mem + 0x30, season_str_ptr)
                 self.write_i32(param_mem + 0x38, target_star)
                 for i, f in enumerate(fish_list_10):
-                    self.write_ptr(param_mem + 0x40 + i * 8, f['idPtr'])
+                    id_ptr = f.get('idPtr', 0)
+                    if not id_ptr or not self.read_utf16_str(id_ptr):
+                        id_ptr = self.create_managed_string(f['id'])
+                    self.write_ptr(param_mem + 0x40 + i * 8, id_ptr)
 
                 # 組合 16 位元組對齊之 x64 Shellcode
                 sc = bytearray()
@@ -1966,7 +1970,10 @@ class PCFishMemory:
                 self.write_ptr(param_mem + 0x20, fn_merge)
                 self.write_ptr(param_mem + 0x28, nm_inst)
                 for i, f in enumerate(fish_list_10):
-                    self.write_ptr(param_mem + 0x30 + i * 8, f['idPtr'])
+                    id_ptr = f.get('idPtr', 0)
+                    if not id_ptr or not self.read_utf16_str(id_ptr):
+                        id_ptr = self.create_managed_string(f['id'])
+                    self.write_ptr(param_mem + 0x30 + i * 8, id_ptr)
 
                 # 組合 16 位元組對齊之 x64 Shellcode
                 sc = bytearray()
@@ -2023,23 +2030,20 @@ class PCFishMemory:
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_mem), 0, 0x8000)
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
 
-            # 極速輕量動態輪詢伺服端扣除材料握手確認 (最多等待 8.0 秒，避免 900+ 魚庫遍歷卡頓)
+            # 極速精準動態輪詢伺服端扣料握手確認 (最多等待 8.0 秒，雙重核驗杜絕假成功)
             server_confirmed = False
             gdm = self.locate_gamedata_manager()
             l_ptr = self.read_ptr(gdm + 0x68) if gdm else 0
-            initial_count = self.read_i32(l_ptr + 0x18) if l_ptr else len(fish_list_10)
+            initial_count = self.read_i32(l_ptr + 0x18) if l_ptr else 0
 
             for step in range(16):
                 time.sleep(0.5)
-                # 優先極速檢查魚隻計數 (材料消耗 10 條 + 產物發放 1 條，淨減少 9 條或至少減少)
-                if l_ptr:
-                    curr_cnt = self.read_i32(l_ptr + 0x18)
-                    if curr_cnt <= initial_count - 9:
-                        server_confirmed = True
-                        break
+                # 快速計數初篩：確保有效讀取且淨減少 9 隻以上 (扣 10 隻材料 + 發放 1 隻產物)
+                curr_cnt = self.read_i32(l_ptr + 0x18) if l_ptr else 0
+                count_decreased = (curr_cnt > 0 and initial_count > 0 and curr_cnt <= initial_count - 9)
 
-                # 次要精準核驗：每 1 秒才比對一次材料 ID，杜絕全庫解析耗時
-                if (step % 2 == 1) or step == 15:
+                # 當計數減少，或每 1 秒精準核驗一次：必須由材料 ID 確實自背包中被移除作為唯一成功依據
+                if count_decreased or (step % 2 == 1) or step == 15:
                     cur_all = self.get_all_fish()
                     cur_ids = {f['id'] for f in cur_all}
                     consumed = [fid for fid in mat_ids if fid not in cur_ids]
@@ -2070,7 +2074,7 @@ class PCFishMemory:
         report_lines.append("              Auto-PCFish 執行診斷與系統健康報告")
         report_lines.append("=" * 64)
         report_lines.append(f"生成時間: {dt_str}")
-        report_lines.append(f"核心版本: v1.1.9 STABLE")
+        report_lines.append(f"核心版本: v1.2.0 STABLE")
         report_lines.append("")
 
         # 1. 遊戲進程與核心記憶體
