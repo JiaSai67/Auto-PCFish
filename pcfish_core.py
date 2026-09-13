@@ -1629,7 +1629,7 @@ class PCFishMemory:
                     m_amt = req['amount']
                     m_name = FISH_NAMES.get(m_type, m_type)
 
-                    avail = [f for f in inv_pool.get((m_type, m_star), []) if f['id'] not in allocated_ids and not f['is_locked']]
+                    avail = [f for f in inv_pool.get((m_type, m_star), []) if f['id'] not in allocated_ids and not f['is_locked'] and not f.get('is_placed', False)]
                     taken = avail[:m_amt]
                     matched_count += len(taken)
                     selected_for_recipe.extend(taken)
@@ -1667,11 +1667,12 @@ class PCFishMemory:
                 })
 
         # 3. 分流：非賽季魚所需的魚種 + 賽季多餘溢出的魚種 -> 一般魚合成池
-        # 排除已鎖定與基礎魚，且嚴格限制稀有度與星級 (預設上限為高級 2、星級 <= 3，自主保護高星高階魚隻)
+        # 排除已鎖定、已放置魚缸與基礎魚，且嚴格限制稀有度與星級 (預設上限為高級 2、星級 <= 3，自主保護高星高階魚隻)
         general_candidates = [
             f for f in all_fish 
             if f['id'] not in reserved_fish_ids 
             and not f['is_locked'] 
+            and not f.get('is_placed', False)
             and not f.get('is_basic', False)
             and f.get('rarity_val', 1) <= max_merge_rarity
             and f.get('star', 1) <= max_merge_star
@@ -2056,7 +2057,7 @@ class PCFishMemory:
         report_lines.append("              Auto-PCFish 執行診斷與系統健康報告")
         report_lines.append("=" * 64)
         report_lines.append(f"生成時間: {dt_str}")
-        report_lines.append(f"核心版本: v1.1.7 STABLE")
+        report_lines.append(f"核心版本: v1.1.8 STABLE")
         report_lines.append("")
 
         # 1. 遊戲進程與核心記憶體
