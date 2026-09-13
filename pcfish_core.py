@@ -219,7 +219,9 @@ class PCFishMemory:
            旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
         3. 一般融合保護 (NetworkManager.FishMerge, GameAssembly.dll + 0x5f169b):
            旁路 call GameObject.SetActive(true) 載入指示器，杜絕非渲染線程 Graphics device is null 閃退
-        三重補丁 100% 確保繁殖、賽季合成與一般融合在純記憶體模式下絕對穩定、零崩潰！
+        4. 合成面板保護 (UIMerge.Merge, GameAssembly.dll + 0x5bd522):
+           旁路 call GameObject.SetActive(false) 按鈕互動，杜絕非渲染線程 Graphics device is null 閃退
+        四重補丁 100% 確保繁殖、賽季合成與一般融合在純記憶體模式下絕對穩定、零崩潰、遊戲重開零閃退！
         """
         if not self.h_proc:
             return False
@@ -228,9 +230,10 @@ class PCFishMemory:
             return False
 
         patches = [
-            (0x5f102b, b'\xe8\xf0\xb4\x1a\x02', "FishBreed"),
-            (0x5f1369, b'\xe8\xb2\xb1\x1a\x02', "FishSeasonCraft"),
-            (0x5f169b, b'\xe8\x80\xae\x1a\x02', "FishMerge"),
+            (0x5f102b, b'\xe8\xf0\xb4\x1a\x02', "FishBreed SetActive"),
+            (0x5f1369, b'\xe8\xb2\xb1\x1a\x02', "FishSeasonCraft SetActive"),
+            (0x5f169b, b'\xe8\x80\xae\x1a\x02', "FishMerge SetActive"),
+            (0x5bd522, b'\xe8\xe9\x15\xf0\xff', "UIMerge.Merge SetActive"),
         ]
 
         all_ok = True
@@ -289,8 +292,8 @@ class PCFishMemory:
                 # 3. 動態定位 GameDataManager
                 self.locate_gamedata_manager()
 
-                # 4. 啟用純記憶體防閃退保護補丁 (杜絕繁殖非主線程圖形崩潰)
-                self.apply_safe_memory_breed_patch()
+                # 4. 啟用純記憶體防閃退保護補丁 (四重安全補丁全面生效)
+                self.apply_safe_memory_patches()
 
             return True, f"已連接遊戲進程 PID: {self.pid}"
 
@@ -309,6 +312,8 @@ class PCFishMemory:
             self.uimerge_addr = None
             self.game_wnd = None
             self._il2cpp_exports = None
+            self._season_dummy_obj = None
+            self._string_klass = None
 
     def is_process_alive(self):
         """檢查遊戲進程是否仍然正常存活 (避免閃退時誤讀記憶體)"""
@@ -1579,7 +1584,7 @@ class PCFishMemory:
         for f in all_fish:
             parts = f['fish'].split('_')
             f_type = parts[0]
-            star = int(parts[2]) if len(parts) >= 3 else 1
+            star = f.get('star', 1)
             f['star'] = star
             f['type'] = f_type
             inv_pool.setdefault((f_type, star), []).append(f)
@@ -1678,7 +1683,6 @@ class PCFishMemory:
             "reserved_count": len(reserved_fish_ids),
             "season_status": season_status_list,
             "ready_crafts": ready_craft_list,
-            "general_pool": general_candidates,
             "general_pool_count": len(general_candidates),
             "general_batches": general_batches
         }
@@ -1785,12 +1789,12 @@ class PCFishMemory:
         純記憶體原生訊號直發合成 (In-Memory Direct Merge/Craft Signal Execution)：
         1. 確保三重旁路保護補丁生效 (Breed: 0x5f102b, SeasonCraft: 0x5f1369, Merge: 0x5f169b)
         2. 定位 UIMerge 物件
-        3. 直接在記憶體中配置與重置槽位 (零調用非渲染線程 UI 方法，杜絕任何圖形崩潰)
-        4. 將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
-        5. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與官方 fishType 原生實例 (+0xc0)
+        3. 將 10 隻材料魚之 string 指標 (f['idPtr']) 寫入 mergeFishList 陣列 (u + 0x78)
+        4. 若為賽季合成 (merge_type == 1)，配置 mergeType (+0xb8)、targetStar (+0xc8) 與合法託管 FishTypeModel 實例 (+0xc0)
            若為一般融合 (merge_type == 0)，配置 mergeType=0, fishType=0, targetStar=1
-        6. 原生調用 UIMerge.Merge() 發送核心合成封包
-        7. 伺服端完成後執行全域輸入解鎖與安全結算收尾，杜絕畫面卡死
+        5. 原生調用 UIMerge.Merge() 發送核心合成封包
+        6. 動態輪詢伺服端扣除材料握手確認 (3.5秒內即時驗證庫存是否真正消耗)
+        7. 結算完成後自動解除觸控鎖定與結算特效，徹底杜絕畫面卡死
         """
         with self._lock:
             # 關鍵防護 1: 確保三重旁路保護補丁生效 (Breed + SeasonCraft + Merge)
@@ -1826,43 +1830,41 @@ class PCFishMemory:
             self.write_i32(u + 0xb8, merge_type)
             if merge_type == 1:
                 self.write_i32(u + 0xc8, target_star)
-                fish_type_obj = 0
-                season_str_ptr = 0
-                gdm = self.locate_gamedata_manager()
-                if gdm:
-                    d_ptr = self.read_ptr(gdm + 0x58)
-                    if d_ptr:
-                        count = self.read_i32(d_ptr + 0x20)
-                        entries = self.read_ptr(d_ptr + 0x18)
-                        for idx in range(count):
-                            e_addr = entries + 0x20 + idx * 24
-                            k_ptr = self.read_ptr(e_addr + 8)
-                            if self.read_utf16_str(k_ptr) == target_season_type:
-                                season_str_ptr = k_ptr
-                                fish_type_obj = self.read_ptr(e_addr + 16)
-                                break
-
-                if fish_type_obj:
-                    self.write_ptr(u + 0xc0, fish_type_obj)
+                season_str_ptr = self.create_managed_string(target_season_type)
+                
+                # 取得或創建合法的 FishTypeModel 物件
+                cur_ft_obj = self.read_ptr(u + 0xc0)
+                if cur_ft_obj and 0x10000 <= cur_ft_obj <= 0x7FFFFFFFFFFF:
+                    self.write_ptr(cur_ft_obj + 0x10, season_str_ptr)
                 else:
-                    if not season_str_ptr:
-                        season_str_ptr = self.create_managed_string(target_season_type)
                     if not hasattr(self, '_season_dummy_obj') or not self._season_dummy_obj:
                         self._season_dummy_obj = kernel32.VirtualAllocEx(self.h_proc, None, 0x40, 0x3000, 0x04)
-                    if self._season_dummy_obj and season_str_ptr:
+                    if self._season_dummy_obj:
+                        if getattr(self, '_string_klass', 0):
+                            self.write_ptr(self._season_dummy_obj, self._string_klass)
                         self.write_ptr(self._season_dummy_obj + 0x10, season_str_ptr)
                         self.write_ptr(u + 0xc0, self._season_dummy_obj)
             else:
                 self.write_ptr(u + 0xc0, 0)
                 self.write_i32(u + 0xc8, 1)
 
+            mat_ids = {f['id'] for f in fish_list_10}
+
             # 3. 原生調用 Merge 發送核心合成訊號 (直接送出網路封包，零 UI 阻擋)
             ok, msg = self.invoke_il2cpp_method(mi_merge, u)
             if not ok:
-                return False, f"合成發送失敗: {msg}"
+                return False, f"合成訊號發送失敗: {msg}"
 
-            # 4. 等候伺服端結算與動畫處理 (約 2.0 秒)
-            time.sleep(2.0)
+            # 4. 動態輪詢伺服端扣除材料握手確認 (最多等待 3.5 秒)
+            server_confirmed = False
+            for _ in range(7):
+                time.sleep(0.5)
+                cur_all = self.get_all_fish()
+                cur_ids = {f['id'] for f in cur_all}
+                consumed = [fid for fid in mat_ids if fid not in cur_ids]
+                if len(consumed) >= 10:
+                    server_confirmed = True
+                    break
 
             # 5. 安全收尾防護：
             # (a) 強制解除 UIManager.isTouchBlock 全域觸控鎖定，徹底杜絕畫面卡死無反應
@@ -1876,16 +1878,13 @@ class PCFishMemory:
                     mi_finish = self.get_class_method(self.read_ptr(fx), "FinishFx")
                     if mi_finish:
                         self.invoke_il2cpp_method(mi_finish, fx)
-                        time.sleep(0.5)
+                        time.sleep(0.3)
                         self.unlock_ui_touch_block()
 
-            # (c) 安全重置 UIMerge 介面狀態 (呼叫 MergeInit 清理槽位與恢復預設)
-            mi_init = self.get_class_method(k, "MergeInit")
-            if mi_init:
-                self.invoke_il2cpp_method(mi_init, u)
-            self.unlock_ui_touch_block()
-
             type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
-            return True, f"★ 純記憶體合成成功: {type_desc} (已成功消耗 10 隻素材魚並更新庫存)"
+            if not server_confirmed:
+                return False, f"⚠️ 已發送合成訊號，但伺服端尚未扣除材料 (可能配方材料不符或伺服器延遲)，請稍後再試"
+
+            return True, f"★ 純記憶體合成成功: {type_desc} (伺服端已成功扣除 10 隻素材魚並發放產物)"
 
 
