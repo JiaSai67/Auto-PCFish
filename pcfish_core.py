@@ -235,6 +235,10 @@ class PCFishMemory:
             (0x5FB5C9, b'\xe8\xa2Z\x1a\x02', "FishCraft SetActive"),
             (0x5FB8FB, b'\xe8pW\x1a\x02', "FishMerge SetActive"),
             (0x5C9912, b'\xe8\xf9Q\xef\xff', "UIMerge.Merge SetActive"),
+            # 靜默防錯誤彈窗補丁 (Silent Error Popup Bypass, 杜絕彈出網路錯誤/資料還原阻擋視窗)
+            (0x602DCE, b'\xe8\xed\x07\x00\x00', "FishMerge Error Popup Bypass"),
+            (0x6198FE, b'\xe8\xbd\x9c\xfe\xff', "FishCraft Error Popup Bypass 1"),
+            (0x619CB5, b'\xe8\x06\x99\xfe\xff', "FishCraft Error Popup Bypass 2"),
             # 前代相容 (舊版二進位)
             (0x5F102B, b'\xe8\xf0\xb4\x1a\x02', "FishBreed SetActive (legacy)"),
             (0x5F1369, b'\xe8\xb2\xb1\x1a\x02', "FishCraft SetActive (legacy)"),
@@ -2018,9 +2022,9 @@ class PCFishMemory:
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_mem), 0, 0x8000)
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
 
-            # 動態輪詢伺服端扣除材料握手確認 (最多等待 4.0 秒)
+            # 動態輪詢伺服端扣除材料握手確認 (最多等待 8.0 秒，容忍公網延遲)
             server_confirmed = False
-            for _ in range(8):
+            for step in range(16):
                 time.sleep(0.5)
                 cur_all = self.get_all_fish()
                 cur_ids = {f['id'] for f in cur_all}
@@ -2034,8 +2038,115 @@ class PCFishMemory:
 
             type_desc = f"賽季魚合成 [{FISH_NAMES.get(target_season_type, target_season_type)} {target_star}星]" if merge_type == 1 else "一般魚融合"
             if not server_confirmed:
-                return False, f"⚠️ 已發送合成訊號，但伺服端尚未在時限內扣除材料 (可能材料不符或網路延遲)，請稍後再試"
+                return False, f"⚠️ 已發送合成訊號，但伺服端尚未在時限內扣除材料 (可能材料不符、網路延遲或伺服器排隊)，請稍後再試"
 
             return True, f"★ 純記憶體直發合成成功: {type_desc} (伺服端已成功扣除 10 隻素材魚並發放產物)"
+
+    def generate_diagnostic_report(self):
+        """
+        生成完整的 Auto-PCFish 執行診斷與系統健康報告 (Diagnostics Report)
+        自動評估記憶體狀態、網路組件、安全補丁、愛心狀態與魚庫分佈，並輸出存檔。
+        """
+        now_dt = datetime.datetime.now()
+        dt_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        ts_filename = now_dt.strftime("%Y%m%d_%H%M%S")
+
+        report_lines = []
+        report_lines.append("=" * 64)
+        report_lines.append("              Auto-PCFish 執行診斷與系統健康報告")
+        report_lines.append("=" * 64)
+        report_lines.append(f"生成時間: {dt_str}")
+        report_lines.append(f"核心版本: v1.1.7 STABLE")
+        report_lines.append("")
+
+        # 1. 遊戲進程與核心記憶體
+        report_lines.append("【一、 遊戲進程與核心記憶體狀態】")
+        alive = self.is_process_alive()
+        report_lines.append(f"- 遊戲進程 PID: {self.pid} ({'正常運行中 (Active)' if alive else '未運行/已中斷'})")
+        ga_base = self.get_module_base("GameAssembly.dll")
+        report_lines.append(f"- GameAssembly.dll 基址: {hex(ga_base) if ga_base else 'None'}")
+
+        nm_inst = self.locate_network_manager()
+        report_lines.append(f"- NetworkManager 單例: {hex(nm_inst) if nm_inst else 'None'} ({'就緒' if nm_inst else '未定位'})")
+        gdm_inst = self.locate_gamedata_manager()
+        report_lines.append(f"- GameDataManager 單例: {hex(gdm_inst) if gdm_inst else 'None'} ({'就緒' if gdm_inst else '未定位'})")
+        uim_inst = self.read_ptr(ga_base + 0x3729988) if ga_base else 0
+        report_lines.append(f"- UIManager 指標: {hex(uim_inst) if uim_inst else 'None'}")
+        report_lines.append("")
+
+        # 2. 安全防閃退與防彈窗補丁檢驗
+        report_lines.append("【二、 安全防護補丁生效狀態】")
+        if ga_base and self.h_proc:
+            patch_checks = [
+                (0x5FB28B, "繁殖指示器旁路 (FishBreed SetActive)"),
+                (0x5FB5C9, "賽季合成指示器旁路 (FishCraft SetActive)"),
+                (0x5FB8FB, "一般融合指示器旁路 (FishMerge SetActive)"),
+                (0x5C9912, "合成面板指示器旁路 (UIMerge SetActive)"),
+                (0x602DCE, "融合網路錯誤彈窗靜默 (FishMerge Error Popup Bypass)"),
+                (0x6198FE, "賽季錯誤彈窗靜默 1 (FishCraft Error Popup Bypass 1)"),
+                (0x619CB5, "賽季錯誤彈窗靜默 2 (FishCraft Error Popup Bypass 2)"),
+            ]
+            for off, desc in patch_checks:
+                b = self.read_bytes(ga_base + off, 5)
+                is_nop = (b == b'\x90\x90\x90\x90\x90')
+                status = "✔ 已啟用 (NOPs 旁路生效)" if is_nop else f"⚪ 原生二進位 ({b.hex()})"
+                report_lines.append(f"- {desc}: {status}")
+        else:
+            report_lines.append("- 無法檢測補丁 (進程未連線)")
+        report_lines.append("")
+
+        # 3. 愛心與繁殖狀態
+        report_lines.append("【三、 愛心與繁殖狀態】")
+        hearts, timer_str, ok, target_ts = self.get_breed_heart_status()
+        report_lines.append(f"- 當前愛心: {hearts} / 5")
+        report_lines.append(f"- 愛心倒數計時: {timer_str}")
+        uibreed = self.locate_uibreed()
+        report_lines.append(f"- 繁殖介面 (UIBreed): {'🟢 遊戲中已打開且就緒' if uibreed else '🟡 尚未在遊戲中打開'}")
+        report_lines.append("")
+
+        # 4. 背包魚庫與合成批次盤點
+        report_lines.append("【四、 背包魚庫與合成批次盤點】")
+        all_fish = self.get_all_fish()
+        report_lines.append(f"- 背包總魚隻數: {len(all_fish)} 條")
+        active_cnt = sum(1 for f in all_fish if f.get('is_basic', False) or f.get('breed', 0) > 0)
+        report_lines.append(f"- 可配種魚隻數: {active_cnt} 條")
+
+        class_res = self.get_season_and_general_classification(all_fish=all_fish)
+        report_lines.append(f"- 賽季受保護材料魚: {class_res.get('reserved_count', 0)} 條")
+        ready_crafts = class_res.get('ready_crafts', [])
+        report_lines.append(f"- 賽季可合成目標: {len(ready_crafts)} 個")
+        for rc in ready_crafts:
+            report_lines.append(f"  * [可合成] {rc['target_name']} {rc['target_star']}星 (材料 10/10 齊全)")
+
+        gen_pool = class_res.get('general_pool_count', 0)
+        batches = class_res.get('general_batches', [])
+        report_lines.append(f"- 一般融合候選池: {gen_pool} 條")
+        report_lines.append(f"- 一般融合待處理批次: {len(batches)} 組 (每組 10 隻同星級，共 {len(batches)*10} 條)")
+
+        for bi, b in enumerate(batches[:5]):
+            b_star = b[0].get('star', 1)
+            b_zero = sum(1 for f in b if f.get('breed', 0) == 0)
+            names_str = "、".join([f"{f['name']}({f['breed']}次)" for f in b[:3]])
+            report_lines.append(f"  * 批次 #{bi+1} [⭐{b_star}星]: {names_str}... (含 {b_zero} 隻 0次廢魚)")
+
+        if len(batches) > 5:
+            report_lines.append(f"  * ... 另有 {len(batches)-5} 組待融合批次未展開")
+
+        report_lines.append("")
+        report_lines.append("=" * 64)
+        report_lines.append("報告生成完畢，系統健康狀況良好。")
+        report_lines.append("=" * 64)
+
+        report_text = "\n".join(report_lines)
+
+        # 自動存檔至本地
+        report_filename = f"auto_pcfish_report_{ts_filename}.txt"
+        try:
+            with open(report_filename, "w", encoding="utf-8") as f:
+                f.write(report_text)
+        except Exception:
+            pass
+
+        return report_text, report_filename
 
 

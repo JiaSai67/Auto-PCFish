@@ -1,5 +1,5 @@
 """
-PC Fish 智能繁殖與合成管理終端 v1.1.6 STABLE
+PC Fish 智能繁殖與合成管理終端 v1.1.7 STABLE
 - 依照 Impeccable (Operate Mode) 與 AI Tool Standard 規範全新重構
 - 100% 記憶體直讀 GameDataManager (愛心數量、倒數計時、魚隻列表)
 - 魚種冷卻時間全面導入本地 Windows 時間戳登記與平滑倒數
@@ -10,8 +10,10 @@ PC Fish 智能繁殖與合成管理終端 v1.1.6 STABLE
 - 嚴格導入官方數值底層最高期望值黃金階梯配對 (杜絕 3+2、2+1 降階污染)
 - 🌟 全新支援官方賽季魚 (FS00033 霜藍翻車魚、FS00034 萊姆背海龜、FS00035 祭典章魚) 1~5 星合成雷達
 - 🌟 賽季材料自動鎖定保護 (防挪用) + 非賽季/溢出魚分流一般魚融合池 (0次廢魚優先耗損)
-- 🌟 原生 NetworkManager 訊號直發 (FishCraft / FishMerge)：四重防閃退安全補丁 + il2cpp_array_new 託管陣列注入 + 伺服端扣料握手驗證 + UIManager 輸入鎖定解除，徹底杜絕遊戲閃退與卡死
+- 🌟 七重安全記憶體補丁：四重防閃退圖形旁路 + 三重靜默防錯誤彈窗 (徹底杜絕遊戲閃退與「發生網路錯誤/資料還原」阻擋視窗)
 - 🌟 一般魚嚴格依同星級分組打包 (100% 同星級安全融合，杜絕混星被伺服端拒絕)
+- 🌟 伺服端材料扣除握手輪詢容忍度提升至 8.0 秒，抗公網延遲與伺服器排隊
+- 🌟 全新內建「📑 系統執行診斷報告」生成引擎，隨時一鍵導出系統健康診斷書
 - 🌟 自主設定星級上限與稀有度上限防護（預設 <=3 星、<=高級，保護高星高階魚種）
 """
 
@@ -37,7 +39,7 @@ from pcfish_core import PCFishMemory, RARITY_MAP, SEASON_TARGETS, SEASON_RECIPES
 class AutoBreedApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.6 STABLE (純記憶體直發)")
+        self.root.title("PC Fish 智能繁殖與合成管理終端 v1.1.7 STABLE (純記憶體直發)")
         self.root.geometry("740x860")
         self.root.minsize(700, 720)
         self.root.configure(bg="#181825")
@@ -174,7 +176,7 @@ class AutoBreedApp:
 
         lbl_version_badge = tk.Label(
             title_box,
-            text="v1.1.6 STABLE",
+            text="v1.1.7 STABLE",
             font=("Segoe UI", 8, "bold"),
             fg="#181825",
             bg=self.c_accent_blue,
@@ -199,7 +201,23 @@ class AutoBreedApp:
             activeforeground=self.c_text,
             font=self.font_small
         )
-        cb_ontop.pack(side="left", padx=(0, 8))
+        cb_ontop.pack(side="left", padx=(0, 6))
+
+        btn_diag_report = tk.Button(
+            top_actions,
+            text="📑 診斷報告",
+            font=self.font_small,
+            bg=self.c_card,
+            fg=self.c_gold,
+            activebackground=self.c_border,
+            activeforeground=self.c_text,
+            bd=0,
+            padx=8,
+            pady=2,
+            cursor="hand2",
+            command=self.show_diagnostic_report
+        )
+        btn_diag_report.pack(side="left", padx=(0, 6))
 
         btn_manual_refresh = tk.Button(
             top_actions,
@@ -1298,6 +1316,73 @@ class AutoBreedApp:
             except Exception as e:
                 self.log(f"批量融合循環異常: {str(e)}")
                 time.sleep(2.0)
+
+    def show_diagnostic_report(self):
+        """生成並彈窗展示系統執行診斷與健康報告"""
+        try:
+            attached, msg = self.mem.attach()
+            rep_text, filename = self.mem.generate_diagnostic_report()
+            self.log(f"📑 執行診斷報告已生成並存檔至: {filename}")
+
+            # 建立報告預覽獨立視窗
+            top = tk.Toplevel(self.root)
+            top.title(f"Auto-PCFish 執行診斷報告 - {filename}")
+            top.geometry("680x560")
+            top.minsize(550, 400)
+            top.configure(bg="#181825")
+            top.attributes("-topmost", True)
+
+            txt = scrolledtext.ScrolledText(
+                top,
+                wrap="none",
+                font=("Consolas", 9),
+                bg="#1e1e2e",
+                fg="#cdd6f4",
+                insertbackground="#cdd6f4",
+                bd=0,
+                padx=10,
+                pady=10
+            )
+            txt.pack(fill="both", expand=True, padx=12, pady=12)
+            txt.insert("1.0", rep_text)
+            txt.configure(state="disabled")
+
+            btn_box = tk.Frame(top, bg="#181825")
+            btn_box.pack(fill="x", padx=12, pady=(0, 12))
+
+            def copy_to_clipboard():
+                self.root.clipboard_clear()
+                self.root.clipboard_append(rep_text)
+                messagebox.showinfo("複製成功", "診斷報告全文已複製到剪貼簿！", parent=top)
+
+            btn_copy = tk.Button(
+                btn_box,
+                text="📋 複製報告內容",
+                font=self.font_small,
+                bg=self.c_cyan,
+                fg="#181825",
+                bd=0,
+                padx=12,
+                pady=4,
+                command=copy_to_clipboard
+            )
+            btn_copy.pack(side="left")
+
+            btn_close = tk.Button(
+                btn_box,
+                text="關閉",
+                font=self.font_small,
+                bg=self.c_card,
+                fg=self.c_text,
+                bd=0,
+                padx=12,
+                pady=4,
+                command=top.destroy
+            )
+            btn_close.pack(side="right")
+
+        except Exception as e:
+            self.log(f"生成診斷報告失敗: {str(e)}")
 
     def on_close(self):
         """安全關閉視窗與背景執行緒"""
