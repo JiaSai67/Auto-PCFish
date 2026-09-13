@@ -2023,16 +2023,29 @@ class PCFishMemory:
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(code_mem), 0, 0x8000)
             kernel32.VirtualFreeEx(self.h_proc, ctypes.c_void_p(param_mem), 0, 0x8000)
 
-            # 動態輪詢伺服端扣除材料握手確認 (最多等待 8.0 秒，容忍公網延遲)
+            # 極速輕量動態輪詢伺服端扣除材料握手確認 (最多等待 8.0 秒，避免 900+ 魚庫遍歷卡頓)
             server_confirmed = False
+            gdm = self.locate_gamedata_manager()
+            l_ptr = self.read_ptr(gdm + 0x68) if gdm else 0
+            initial_count = self.read_i32(l_ptr + 0x18) if l_ptr else len(fish_list_10)
+
             for step in range(16):
                 time.sleep(0.5)
-                cur_all = self.get_all_fish()
-                cur_ids = {f['id'] for f in cur_all}
-                consumed = [fid for fid in mat_ids if fid not in cur_ids]
-                if len(consumed) >= 10:
-                    server_confirmed = True
-                    break
+                # 優先極速檢查魚隻計數 (材料消耗 10 條 + 產物發放 1 條，淨減少 9 條或至少減少)
+                if l_ptr:
+                    curr_cnt = self.read_i32(l_ptr + 0x18)
+                    if curr_cnt <= initial_count - 9:
+                        server_confirmed = True
+                        break
+
+                # 次要精準核驗：每 1 秒才比對一次材料 ID，杜絕全庫解析耗時
+                if (step % 2 == 1) or step == 15:
+                    cur_all = self.get_all_fish()
+                    cur_ids = {f['id'] for f in cur_all}
+                    consumed = [fid for fid in mat_ids if fid not in cur_ids]
+                    if len(consumed) >= 10:
+                        server_confirmed = True
+                        break
 
             # 安全收尾防護：強制解除 UIManager 全域輸入鎖定，徹底杜絕畫面無響應
             self.unlock_ui_touch_block()
@@ -2057,7 +2070,7 @@ class PCFishMemory:
         report_lines.append("              Auto-PCFish 執行診斷與系統健康報告")
         report_lines.append("=" * 64)
         report_lines.append(f"生成時間: {dt_str}")
-        report_lines.append(f"核心版本: v1.1.8 STABLE")
+        report_lines.append(f"核心版本: v1.1.9 STABLE")
         report_lines.append("")
 
         # 1. 遊戲進程與核心記憶體
